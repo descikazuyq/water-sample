@@ -236,7 +236,12 @@ func (s *Store) SetLimit(pointID, item string, value float64, effective time.Tim
 			return Limit{}, fmt.Errorf("%w: %s/%s @ %s", ErrDuplicateLimitTime, pointID, item, lim.Effective)
 		}
 	}
+	// 先在独立副本上追加并排序，再整体替换；失败时用 old 原样回滚。
+	// 不能在 old 的共享底层数组上直接 append+sort，否则回滚只恢复切片头，
+	// 被拒绝的版本已写入并打乱原顺序，造成内存状态与磁盘不一致。
 	old := s.limits[key]
+	versions = make([]Limit, len(old), len(old)+1)
+	copy(versions, old)
 	versions = append(versions, lim)
 	sort.Slice(versions, func(i, j int) bool { return versions[i].Effective.Before(versions[j].Effective) })
 	s.limits[key] = versions

@@ -3,6 +3,7 @@ package water
 import (
 	"errors"
 	"math"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -109,6 +110,86 @@ func TestSetLimit(t *testing.T) {
 	}
 	if smp.Results[0].Limit != 7.0 {
 		t.Fatalf("limit overwritten by rejected entry: %+v", smp.Results[0])
+	}
+}
+
+// TestSetLimitFailureKeepsState 覆盖“补录限值落盘失败”的回滚：
+// 失败必须返回错误，且该点该项目的限值在内存与磁盘上都完整保持调用前状态；
+// 恢复后用相同参数重试应成功，已确认结果不随后续补录改变。
+func TestSetLimitFailureKeepsState(t *testing.T) {
+	s, dir := open(t)
+	mustPoint(t, s, "P1", "取水口")
+	mustLimit(t, s, "P1", "pH", 10.0, at(1, 0))
+	mustLimit(t, s, "P1", "pH", 20.0, at(10, 0))
+	mustLimit(t, s, "P1", "pH", 30.0, at(20, 0))
+
+	// 让落盘必然失败：数据文件路径指向不存在的子目录，WriteFile 直接报错。
+	realFile := s.file
+	s.file = filepath.Join(dir, "no-such-dir", "water-data.json")
+	if _, err := s.SetLimit("P1", "pH", 5.0, at(5, 0)); err == nil {
+		t.Fatalf("SetLimit with failing persist must return an error")
+	}
+	s.file = realFile
+
+	// 内存中的限值必须保持调用前状态：9/6 用 10（不能用被拒绝的 5），9/21 用 30（不能退回 20）。
+	mustSample(t, s, "S1", "P1", at(6, 0), Measurement{Item: "pH", Value: 8})
+	smp, err := s.Confirm("S1")
+	if err != nil {
+		t.Fatalf("Confirm S1: %v", err)
+	}
+	if smp.Results[0].Limit != 10.0 {
+		t.Fatalf("9/6 should still use limit 10, got %v", smp.Results[0].Limit)
+	}
+	mustSample(t, s, "S2", "P1", at(21, 0), Measurement{Item: "pH", Value: 25})
+	smp2, err := s.Confirm("S2")
+	if err != nil {
+		t.Fatalf("Confirm S2: %v", err)
+	}
+	if smp2.Results[0].Limit != 30.0 {
+		t.Fatalf("9/21 should still use limit 30, got %v", smp2.Results[0].Limit)
+	}
+
+	// 恢复后用相同采样点、项目、生效时间和数值重试，应成功（不能把上次失败当成已登记而报重复）。
+	if _, err := s.SetLimit("P1", "pH", 5.0, at(5, 0)); err != nil {
+		t.Fatalf("retry after recovery should succeed: %v", err)
+	}
+	// 补录成功后，尚未确认的 9/6 样品改用 5；9/21 已确认样品仍保留 30。
+	mustSample(t, s, "S3", "P1", at(6, 0), Measurement{Item: "pH", Value: 8})
+	smp3, err := s.Confirm("S3")
+	if err != nil {
+		t.Fatalf("Confirm S3: %v", err)
+	}
+	if smp3.Results[0].Limit != 5.0 {
+		t.Fatalf("9/6 after backfill should use limit 5, got %v", smp3.Results[0].Limit)
+	}
+	if again, err := s.Confirm("S2"); err != nil || again.Results[0].Limit != 30.0 {
+		t.Fatalf("already-confirmed S2 must keep limit 30, got %+v err=%v", again.Results[0], err)
+	}
+
+	// 失败后又成功录入/确认过样品，关闭重开仍应看到最后成功保存的限值状态（含 5，含 30）。
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	mustSample(t, s2, "S4", "P1", at(6, 0), Measurement{Item: "pH", Value: 8})
+	smp4, err := s2.Confirm("S4")
+	if err != nil {
+		t.Fatalf("Confirm S4 after reopen: %v", err)
+	}
+	if smp4.Results[0].Limit != 5.0 {
+		t.Fatalf("reopened 9/6 should use limit 5, got %v", smp4.Results[0].Limit)
+	}
+	mustSample(t, s2, "S5", "P1", at(21, 0), Measurement{Item: "pH", Value: 25})
+	smp5, err := s2.Confirm("S5")
+	if err != nil {
+		t.Fatalf("Confirm S5 after reopen: %v", err)
+	}
+	if smp5.Results[0].Limit != 30.0 {
+		t.Fatalf("reopened 9/21 should use limit 30, got %v", smp5.Results[0].Limit)
 	}
 }
 

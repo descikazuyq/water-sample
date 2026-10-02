@@ -237,7 +237,11 @@ func (s *Store) SetLimit(pointID, item string, value float64, effective time.Tim
 		}
 	}
 	old := s.limits[key]
-	versions = append(versions, lim)
+	// 复制到新切片再插入排序：append/sort 会原地改动共享底层数组，
+	// 一旦保存失败需要回滚，old 必须仍是调用前的完整状态。
+	versions = make([]Limit, len(old)+1)
+	copy(versions, old)
+	versions[len(old)] = lim
 	sort.Slice(versions, func(i, j int) bool { return versions[i].Effective.Before(versions[j].Effective) })
 	s.limits[key] = versions
 	if err := s.persistLocked(); err != nil {

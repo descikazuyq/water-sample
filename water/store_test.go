@@ -3,6 +3,8 @@ package water
 import (
 	"errors"
 	"math"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -109,6 +111,103 @@ func TestSetLimit(t *testing.T) {
 	}
 	if smp.Results[0].Limit != 7.0 {
 		t.Fatalf("limit overwritten by rejected entry: %+v", smp.Results[0])
+	}
+}
+
+// 新增限值保存失败时，当前打开的数据存放必须完整保持调用前的状态：
+// 被拒绝的限值不能继续参与判定，原有版本及其适用时间不能丢失或错乱；
+// 条件恢复后相同补录可重试成功，且失败期间的其它成功操作不能把
+// 被拒绝的限值或版本丢失顺带落盘。
+func TestSetLimitPersistFailure(t *testing.T) {
+	s, dir := open(t)
+	mustPoint(t, s, "P1", "取水口")
+	mustLimit(t, s, "P1", "pH", 10.0, at(1, 0))
+	mustLimit(t, s, "P1", "pH", 20.0, at(10, 0))
+	mustLimit(t, s, "P1", "pH", 30.0, at(20, 0))
+
+	// 让落盘失败：把临时文件路径占成目录，WriteFile 必然失败
+	tmp := filepath.Join(dir, "water-data.json.tmp")
+	if err := os.Mkdir(tmp, 0o755); err != nil {
+		t.Fatalf("block persist: %v", err)
+	}
+	// 乱序补录到已有版本之间，保存失败
+	if _, err := s.SetLimit("P1", "pH", 5.0, at(5, 0)); err == nil {
+		t.Fatal("SetLimit should fail when persist fails")
+	}
+	// 失败发生在更晚生效的版本上同样不能丢原有版本
+	if _, err := s.SetLimit("P1", "pH", 35.0, at(25, 0)); err == nil {
+		t.Fatal("SetLimit should fail when persist fails")
+	}
+	// 恢复正常保存条件
+	if err := os.Remove(tmp); err != nil {
+		t.Fatalf("restore persist: %v", err)
+	}
+
+	// 9/6 采样、值 8：必须使用 9/1 的上限 10 判为达标，不能用被拒绝的 5
+	mustSample(t, s, "S1", "P1", at(6, 0), Measurement{Item: "pH", Value: 8})
+	smp1, err := s.Confirm("S1")
+	if err != nil {
+		t.Fatalf("Confirm S1: %v", err)
+	}
+	if smp1.Results[0].Limit != 10.0 || smp1.Exceeded {
+		t.Fatalf("rejected limit leaked into judgment: %+v", smp1.Results[0])
+	}
+	// 9/21 采样、值 25：必须使用 9/20 的上限 30 判为达标，不能因版本丢失退回 20
+	mustSample(t, s, "S2", "P1", at(21, 0), Measurement{Item: "pH", Value: 25})
+	smp2, err := s.Confirm("S2")
+	if err != nil {
+		t.Fatalf("Confirm S2: %v", err)
+	}
+	if smp2.Results[0].Limit != 30.0 || smp2.Exceeded {
+		t.Fatalf("original version lost after failed save: %+v", smp2.Results[0])
+	}
+
+	// 相同补录可以重试成功，不能把上次失败当成已登记
+	mustLimit(t, s, "P1", "pH", 5.0, at(5, 0))
+
+	// 成功补录后，尚未确认且采样于 9/6 的样品使用上限 5
+	mustSample(t, s, "S3", "P1", at(6, 0), Measurement{Item: "pH", Value: 8})
+	smp3, err := s.Confirm("S3")
+	if err != nil {
+		t.Fatalf("Confirm S3: %v", err)
+	}
+	if smp3.Results[0].Limit != 5.0 || !smp3.Exceeded {
+		t.Fatalf("backfilled limit should apply to pending sample: %+v", smp3.Results[0])
+	}
+	// 已确认样品保留原判定及所用限值，重复确认不重新计算
+	again1, err := s.Confirm("S1")
+	if err != nil || again1.Results[0].Limit != 10.0 || again1.Exceeded {
+		t.Fatalf("confirmed result must not change, got %+v err=%v", again1.Results[0], err)
+	}
+	again2, err := s.Confirm("S2")
+	if err != nil || again2.Results[0].Limit != 30.0 || again2.Exceeded {
+		t.Fatalf("confirmed result must not change, got %+v err=%v", again2.Results[0], err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 重新打开：应看到最后成功保存的限值状态——四版俱在，
+	// 被拒绝且未重试的 35@9/25 不能被失败期间的成功操作顺带保存进去
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	mustSample(t, s2, "S4", "P1", at(6, 0), Measurement{Item: "pH", Value: 8})
+	smp4, err := s2.Confirm("S4")
+	if err != nil || smp4.Results[0].Limit != 5.0 || !smp4.Exceeded {
+		t.Fatalf("reopened: 9/6 should use backfilled 5, got %+v err=%v", smp4.Results[0], err)
+	}
+	mustSample(t, s2, "S5", "P1", at(21, 0), Measurement{Item: "pH", Value: 25})
+	smp5, err := s2.Confirm("S5")
+	if err != nil || smp5.Results[0].Limit != 30.0 || smp5.Exceeded {
+		t.Fatalf("reopened: 9/21 should use 30, got %+v err=%v", smp5.Results[0], err)
+	}
+	mustSample(t, s2, "S6", "P1", at(24, 0), Measurement{Item: "pH", Value: 31})
+	smp6, err := s2.Confirm("S6")
+	if err != nil || smp6.Results[0].Limit != 30.0 || !smp6.Exceeded {
+		t.Fatalf("reopened: rejected 35@9/25 must not exist, got %+v err=%v", smp6.Results[0], err)
 	}
 }
 

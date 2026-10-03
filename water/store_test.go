@@ -341,6 +341,194 @@ func TestConfirm(t *testing.T) {
 	}
 }
 
+// 所有项目都能完成判定、但本地保存结果失败时，本次确认必须整体失败：
+// 已算出的逐项结果与整份样品的超标标记都不能生效，样品保持待判定，
+// 采样点上一份已确认样品仍是最近有效结果；保存条件恢复后可重新确认，
+// 按采样当时适用的限值完整保存逐项判定（一项超标、一项等于上限）。
+func TestConfirmPersistFailure(t *testing.T) {
+	s, dir := open(t)
+	mustPoint(t, s, "P1", "取水口")
+	mustLimit(t, s, "P1", "pH", 8.0, at(1, 0))
+	mustLimit(t, s, "P1", "COD", 30.0, at(1, 0))
+
+	resultByItem := func(rs []ItemResult) map[string]ItemResult {
+		m := make(map[string]ItemResult, len(rs))
+		for _, r := range rs {
+			m[r.Item] = r
+		}
+		return m
+	}
+	find := func(list []Sample, id string) Sample {
+		t.Helper()
+		for _, smp := range list {
+			if smp.ID == id {
+				return smp
+			}
+		}
+		t.Fatalf("sample %q missing from list %+v", id, list)
+		return Sample{}
+	}
+
+	// 采样时间较早、正常保存的已确认样品：pH 7 ≤ 8，达标
+	mustSample(t, s, "S1", "P1", at(5, 0), Measurement{Item: "pH", Value: 7})
+	conf1, err := s.Confirm("S1")
+	if err != nil || conf1.Status != StatusConfirmed || conf1.Exceeded {
+		t.Fatalf("Confirm S1 setup: %+v err=%v", conf1, err)
+	}
+
+	// 更晚的待判定样品：两个项目采样时均有适用上限，pH 超上限，COD 恰好等于上限
+	mustSample(t, s, "S2", "P1", at(10, 0),
+		Measurement{Item: "pH", Value: 9}, Measurement{Item: "COD", Value: 30})
+	// 对照样品：缺少适用上限，用来证明本检查区分判定错误与保存错误
+	mustSample(t, s, "S3", "P1", at(2, 0), Measurement{Item: "SS", Value: 1})
+
+	// 只让确认结果的保存失败：采样点、限值和样品准备此前均已成功落盘。
+	// 占用临时文件路径为目录后，原子写的 WriteFile 必然失败，不依赖目录权限。
+	tmp := filepath.Join(dir, "water-data.json.tmp")
+	if err := os.Mkdir(tmp, 0o755); err != nil {
+		t.Fatalf("block persist: %v", err)
+	}
+
+	// 同样无法保存的条件下，缺上限在判定阶段即以 ErrMissingLimit 拒绝，
+	// 根本走不到保存；S2 的失败必须是与之不同的保存错误。
+	if _, err := s.Confirm("S3"); !errors.Is(err, ErrMissingLimit) {
+		t.Fatalf("missing limit should be a judgment error, got %v", err)
+	}
+	got, err := s.Confirm("S2")
+	if err == nil {
+		t.Fatal("Confirm should fail when results cannot be saved")
+	}
+	if errors.Is(err, ErrMissingLimit) {
+		t.Fatalf("save failure must not be reported as missing limit: %v", err)
+	}
+	if got.ID != "" || got.Status == StatusConfirmed {
+		t.Fatalf("failed save must not return a confirmed sample: %+v", got)
+	}
+
+	// 按采样点查看：原采样时间、项目和测量值保持，状态待判定，
+	// 没有逐项判定结果，整份样品也不能带上失败尝试算出的超标标记。
+	list, err := s.ListByPoint("P1")
+	if err != nil {
+		t.Fatalf("ListByPoint after failed save: %v", err)
+	}
+	if len(list) != 3 {
+		t.Fatalf("list should keep all three samples, got %+v", list)
+	}
+	failed := find(list, "S2")
+	if failed.Status != StatusPending || failed.Exceeded || failed.Results != nil {
+		t.Fatalf("failed confirm must leave pending sample without results: %+v", failed)
+	}
+	if !failed.SampledAt.Equal(at(10, 0)) || len(failed.Measurements) != 2 {
+		t.Fatalf("sampled time and measurements changed: %+v", failed)
+	}
+	values := map[string]float64{}
+	for _, m := range failed.Measurements {
+		values[m.Item] = m.Value
+	}
+	if values["pH"] != 9 || values["COD"] != 30 {
+		t.Fatalf("measurements changed: %+v", failed.Measurements)
+	}
+	if s3 := find(list, "S3"); s3.Status != StatusPending || s3.Results != nil {
+		t.Fatalf("S3 should stay pending without results: %+v", s3)
+	}
+
+	// 同一份已打开的数据存放中，最近有效结果仍是较早的 S1，
+	// 结论与所用限值保持原样，不能被采样更晚的失败尝试顶替。
+	latest, ok, err := s.LatestResult("P1")
+	if err != nil || !ok || latest.ID != "S1" {
+		t.Fatalf("latest valid result should stay S1, got %+v ok=%v err=%v", latest, ok, err)
+	}
+	if latest.Exceeded || len(latest.Results) != 1 {
+		t.Fatalf("S1 conclusion changed: %+v", latest)
+	}
+	r1 := latest.Results[0]
+	if r1.Item != "pH" || r1.Value != 7 || r1.Limit != 8.0 || !r1.LimitEffective.Equal(at(1, 0)) || r1.Exceeded {
+		t.Fatalf("S1 result and limit must remain intact: %+v", r1)
+	}
+
+	// 恢复正常保存条件
+	if err := os.Remove(tmp); err != nil {
+		t.Fatalf("restore persist: %v", err)
+	}
+	// 采样时间之后才生效的新版上限不能影响按采样当时适用限值的重新判定
+	mustLimit(t, s, "P1", "pH", 9.5, at(15, 0))
+
+	// 重新确认：不能被当成已确认而直接返回失败尝试的状态，必须重新判定并成功保存
+	conf2, err := s.Confirm("S2")
+	if err != nil {
+		t.Fatalf("retry Confirm after save restored: %v", err)
+	}
+	checkSaved := func(smp Sample, label string) {
+		t.Helper()
+		if smp.Status != StatusConfirmed || !smp.SampledAt.Equal(at(10, 0)) || !smp.Exceeded || len(smp.Results) != 2 {
+			t.Fatalf("%s: confirmed sample wrong: %+v", label, smp)
+		}
+		rs := resultByItem(smp.Results)
+		ph, cod := rs["pH"], rs["COD"]
+		if ph.Value != 9 || ph.Limit != 8.0 || !ph.LimitEffective.Equal(at(1, 0)) || !ph.Exceeded {
+			t.Fatalf("%s: pH should be 9 > 8@09-01 exceeded, got %+v", label, ph)
+		}
+		if cod.Value != 30 || cod.Limit != 30.0 || !cod.LimitEffective.Equal(at(1, 0)) || cod.Exceeded {
+			t.Fatalf("%s: COD 30 == limit 30@09-01 should pass, got %+v", label, cod)
+		}
+	}
+	checkSaved(conf2, "retry result")
+
+	// 重复确认返回已保存结果
+	again, err := s.Confirm("S2")
+	if err != nil {
+		t.Fatalf("re-confirm S2: %v", err)
+	}
+	checkSaved(again, "re-confirm")
+	// 原样品的结论与所用限值保持原样，不受新限值影响
+	keep1, err := s.Confirm("S1")
+	if err != nil || keep1.Exceeded || keep1.Results[0].Limit != 8.0 || !keep1.Results[0].LimitEffective.Equal(at(1, 0)) {
+		t.Fatalf("S1 must remain confirmed as saved, got %+v err=%v", keep1, err)
+	}
+
+	// 按采样点查看的记录与最近有效结果一致
+	list2, err := s.ListByPoint("P1")
+	if err != nil {
+		t.Fatalf("ListByPoint after recovery: %v", err)
+	}
+	saved := find(list2, "S2")
+	latest2, ok, err := s.LatestResult("P1")
+	if err != nil || !ok || latest2.ID != "S2" {
+		t.Fatalf("later S2 should now be the latest valid result, got %+v ok=%v err=%v", latest2, ok, err)
+	}
+	checkSaved(saved, "list")
+	checkSaved(latest2, "latest")
+	if s3 := find(list2, "S3"); s3.Status != StatusPending || s3.Results != nil || s3.Exceeded {
+		t.Fatalf("S3 should still be pending with no failure marker: %+v", s3)
+	}
+
+	// 重新打开同一数据存放：成功保存的结果落盘，失败尝试不留任何痕迹
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	list3, err := s2.ListByPoint("P1")
+	if err != nil {
+		t.Fatalf("reopened ListByPoint: %v", err)
+	}
+	latest3, ok, err := s2.LatestResult("P1")
+	if err != nil || !ok {
+		t.Fatalf("reopened latest result: %+v ok=%v err=%v", latest3, ok, err)
+	}
+	checkSaved(find(list3, "S2"), "reopened list")
+	checkSaved(latest3, "reopened latest")
+	if r := find(list3, "S1"); r.Status != StatusConfirmed || r.Exceeded || r.Results[0].Limit != 8.0 {
+		t.Fatalf("reopened S1 changed: %+v", r)
+	}
+	if r := find(list3, "S3"); r.Status != StatusPending || r.Results != nil {
+		t.Fatalf("reopened S3 should stay pending: %+v", r)
+	}
+}
+
 func TestVoid(t *testing.T) {
 	s, _ := open(t)
 	mustPoint(t, s, "P1", "取水口")

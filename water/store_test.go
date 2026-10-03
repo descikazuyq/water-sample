@@ -580,6 +580,195 @@ func TestVoid(t *testing.T) {
 	}
 }
 
+// 作废请求合法、样品也存在，却在保存作废记录时失败时，本次作废必须整体失败：
+// 当前打开的数据存放里样品不能先变成作废，已确认时保存的原测量、逐项判定依据、
+// 单项与整份超标标记全部保持原样，作废原因仍为空；它继续作为该采样点的最近
+// 有效结果，重复确认取得原保存结论。保存条件恢复后可用另一个合法原因重新作废
+// 成功，上次失败时填写的原因不能被当成已有原因而报冲突；成功后最近有效结果
+// 退到较早的已确认样品，再确认已作废样品明确拒绝。
+func TestVoidPersistFailure(t *testing.T) {
+	s, dir := open(t)
+	mustPoint(t, s, "P1", "取水口")
+	mustLimit(t, s, "P1", "pH", 8.0, at(1, 0))
+	mustLimit(t, s, "P1", "COD", 30.0, at(1, 0))
+
+	find := func(list []Sample, id string) Sample {
+		t.Helper()
+		for _, smp := range list {
+			if smp.ID == id {
+				return smp
+			}
+		}
+		t.Fatalf("sample %q missing from list %+v", id, list)
+		return Sample{}
+	}
+	// checkS2 校验较晚样品 S2 的原始测量与原判定依据：pH 9 > 8@09-01 超标，
+	// COD 30 == 上限 30@09-01 达标，整份样品超标。
+	checkS2 := func(smp Sample, status Status, reason, label string) {
+		t.Helper()
+		if smp.ID != "S2" || smp.PointID != "P1" || smp.Status != status {
+			t.Fatalf("%s: 编号、采样点或状态被改动: %+v", label, smp)
+		}
+		if !smp.SampledAt.Equal(at(10, 0)) || smp.VoidReason != reason {
+			t.Fatalf("%s: 采样时间或作废原因被改动: %+v", label, smp)
+		}
+		if !smp.Exceeded || len(smp.Measurements) != 2 || len(smp.Results) != 2 {
+			t.Fatalf("%s: 整份超标标记、测量或判定结果数量被改动: %+v", label, smp)
+		}
+		ms := map[string]float64{}
+		for _, m := range smp.Measurements {
+			ms[m.Item] = m.Value
+		}
+		if ms["pH"] != 9 || ms["COD"] != 30 {
+			t.Fatalf("%s: 原始测量值被改动: %+v", label, smp.Measurements)
+		}
+		rs := map[string]ItemResult{}
+		for _, r := range smp.Results {
+			rs[r.Item] = r
+		}
+		if ph := rs["pH"]; ph.Value != 9 || ph.Limit != 8.0 || !ph.LimitEffective.Equal(at(1, 0)) || !ph.Exceeded {
+			t.Fatalf("%s: pH 应为 9 > 8@09-01 超标，不能被清成达标: %+v", label, ph)
+		}
+		if cod := rs["COD"]; cod.Value != 30 || cod.Limit != 30.0 || !cod.LimitEffective.Equal(at(1, 0)) || cod.Exceeded {
+			t.Fatalf("%s: COD 30 == 上限 30@09-01 应达标，不能被改成超标: %+v", label, cod)
+		}
+	}
+
+	// 较早的已确认样品：pH 7 ≤ 8，达标
+	mustSample(t, s, "S1", "P1", at(5, 0), Measurement{Item: "pH", Value: 7})
+	if conf1, err := s.Confirm("S1"); err != nil || conf1.Status != StatusConfirmed || conf1.Exceeded {
+		t.Fatalf("Confirm S1 setup: %+v err=%v", conf1, err)
+	}
+	// 较晚的已确认样品：一项超标、一项恰好等于上限，本就是最近有效结果
+	mustSample(t, s, "S2", "P1", at(10, 0),
+		Measurement{Item: "pH", Value: 9}, Measurement{Item: "COD", Value: 30})
+	conf2, err := s.Confirm("S2")
+	if err != nil {
+		t.Fatalf("Confirm S2 setup: %v", err)
+	}
+	checkS2(conf2, StatusConfirmed, "", "准备数据")
+
+	// 只让作废记录的保存失败：此前的采样点、限值和样品均已成功落盘。
+	// 占用临时文件路径为目录后，原子写的 WriteFile 必然失败，不依赖目录权限。
+	tmp := filepath.Join(dir, "water-data.json.tmp")
+	if err := os.Mkdir(tmp, 0o755); err != nil {
+		t.Fatalf("block persist: %v", err)
+	}
+
+	// 同样无法保存的条件下，非法请求必须在保存阶段之前被拒绝，
+	// 用来证明 S2 的失败是保存错误，而不是样品不存在或空原因造成的拒绝。
+	if _, err := s.Void("nope", "原因"); !errors.Is(err, ErrUnknownSample) {
+		t.Fatalf("unknown sample should be rejected before save, got %v", err)
+	}
+	if _, err := s.Void("S2", "   "); !errors.Is(err, ErrEmptyField) {
+		t.Fatalf("blank reason should be rejected before save, got %v", err)
+	}
+
+	// 合法的作废请求因本地保存无法完成而整体失败：返回保存错误，
+	// 不能返回一份作废成功的记录。
+	failedReason := "  采样瓶破损  "
+	got, err := s.Void("S2", failedReason)
+	if err == nil {
+		t.Fatal("Void should fail when the void record cannot be saved")
+	}
+	if errors.Is(err, ErrUnknownSample) || errors.Is(err, ErrEmptyField) {
+		t.Fatalf("save failure must not be reported as a request rejection: %v", err)
+	}
+	if got.ID != "" || got.Status == StatusVoided {
+		t.Fatalf("failed save must not return a voided sample: %+v", got)
+	}
+
+	// 按采样点查看：较晚样品仍为已确认、作废原因为空，编号、采样点、采样时间、
+	// 两个项目的原始测量值与全部判定依据保持原样。
+	list, err := s.ListByPoint("P1")
+	if err != nil || len(list) != 2 {
+		t.Fatalf("ListByPoint after failed save: %+v err=%v", list, err)
+	}
+	checkS2(find(list, "S2"), StatusConfirmed, "", "失败后按点查看")
+	if s1 := find(list, "S1"); s1.Status != StatusConfirmed || s1.Exceeded {
+		t.Fatalf("earlier sample should stay confirmed and passing: %+v", s1)
+	}
+
+	// 最近有效结果仍是较晚的 S2，不能退到较早的 S1，也不能表示没有结果。
+	latest, ok, err := s.LatestResult("P1")
+	if err != nil || !ok || latest.ID != "S2" {
+		t.Fatalf("latest valid result should stay S2, got %+v ok=%v err=%v", latest, ok, err)
+	}
+	checkS2(latest, StatusConfirmed, "", "失败后最近有效结果")
+
+	// 再次确认取得原来保存的结论，失败的作废请求不能使确认被拒绝。
+	again, err := s.Confirm("S2")
+	if err != nil {
+		t.Fatalf("re-confirm after failed void: %v", err)
+	}
+	checkS2(again, StatusConfirmed, "", "失败后重复确认")
+
+	// 恢复正常保存条件，用另一个合法原因重新作废同一份样品。
+	if err := os.Remove(tmp); err != nil {
+		t.Fatalf("restore persist: %v", err)
+	}
+	newReason := "复测确认作废"
+	v, err := s.Void("S2", newReason)
+	if err != nil {
+		t.Fatalf("retry Void after save restored: %v", err)
+	}
+	// 上次失败时填写的原因不能被当成已有原因；成功记录保留原测量与原判定依据，
+	// 显示这次成功提交的原因。
+	checkS2(v, StatusVoided, newReason, "重新作废返回值")
+
+	// 相同原因重复作废返回成功记录；上次失败的原因与已保存原因不同，必须按冲突拒绝，
+	// 证明保存下来的是新原因而不是失败尝试的原因。
+	same, err := s.Void("S2", " "+newReason+" ")
+	if err != nil {
+		t.Fatalf("same reason should return saved record: %v", err)
+	}
+	checkS2(same, StatusVoided, newReason, "相同原因重复作废")
+	if _, err := s.Void("S2", "采样瓶破损"); !errors.Is(err, ErrVoidReasonConflict) {
+		t.Fatalf("failed reason must not be the saved reason, got %v", err)
+	}
+
+	// 按点查看仍能找到作废记录；最近有效结果改为较早的 S1。
+	list2, err := s.ListByPoint("P1")
+	if err != nil || len(list2) != 2 {
+		t.Fatalf("ListByPoint after recovery: %+v err=%v", list2, err)
+	}
+	checkS2(find(list2, "S2"), StatusVoided, newReason, "恢复后按点查看")
+	latest2, ok, err := s.LatestResult("P1")
+	if err != nil || !ok || latest2.ID != "S1" {
+		t.Fatalf("latest valid result should fall back to S1, got %+v ok=%v err=%v", latest2, ok, err)
+	}
+	if r := latest2.Results[0]; r.Item != "pH" || r.Value != 7 || r.Limit != 8.0 ||
+		!r.LimitEffective.Equal(at(1, 0)) || r.Exceeded {
+		t.Fatalf("S1 conclusion changed: %+v", r)
+	}
+	// 确认已作废样品应明确拒绝。
+	if _, err := s.Confirm("S2"); !errors.Is(err, ErrVoided) {
+		t.Fatalf("confirm voided sample should be rejected, got %v", err)
+	}
+
+	// 重新打开同一数据存放：成功作废已落盘，失败尝试不留任何痕迹。
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	list3, err := s2.ListByPoint("P1")
+	if err != nil || len(list3) != 2 {
+		t.Fatalf("reopened ListByPoint: %+v err=%v", list3, err)
+	}
+	checkS2(find(list3, "S2"), StatusVoided, newReason, "重开后按点查看")
+	latest3, ok, err := s2.LatestResult("P1")
+	if err != nil || !ok || latest3.ID != "S1" {
+		t.Fatalf("reopened latest result should be S1, got %+v ok=%v err=%v", latest3, ok, err)
+	}
+	if _, err := s2.Confirm("S2"); !errors.Is(err, ErrVoided) {
+		t.Fatalf("reopened confirm voided should be rejected, got %v", err)
+	}
+}
+
 func TestListAndLatest(t *testing.T) {
 	s, _ := open(t)
 	mustPoint(t, s, "P1", "取水口")

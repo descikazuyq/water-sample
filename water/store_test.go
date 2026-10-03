@@ -493,3 +493,150 @@ func TestPersistenceAndIsolation(t *testing.T) {
 		t.Fatalf("other dir should not see S1, got %v", err)
 	}
 }
+
+// 确认样品时，各项目都已按采样当时适用的上限完成判定、但最后本地落盘失败的情况下，
+// 必须返回保存错误，不能把已经算出的逐项结果当成确认成功返回；
+// 样品保持待判定、无逐项判定结果、无失败尝试留下的超标标记，
+// 最近有效结果也不能因为失败样品采样更晚而换成它。
+// 恢复保存条件后再次确认应能成功保存，不能被当成已经确认而直接返回失败尝试的状态。
+func TestConfirmPersistFailure(t *testing.T) {
+	s, dir := open(t)
+	mustPoint(t, s, "P1", "取水口")
+
+	// 已有采样点中一份正常保存的已确认样品（采样更早，值达标）
+	mustLimit(t, s, "P1", "pH", 8.0, at(1, 0))
+	mustSample(t, s, "S1", "P1", at(2, 0), Measurement{Item: "pH", Value: 7})
+	if _, err := s.Confirm("S1"); err != nil {
+		t.Fatalf("Confirm S1: %v", err)
+	}
+
+	// 采样更晚的待判定样品：两个项目在采样时均有适用上限，
+	// 一个值超过上限，另一个值等于上限
+	mustLimit(t, s, "P1", "COD", 30.0, at(1, 0))
+	mustSample(t, s, "S2", "P1", at(5, 0),
+		Measurement{Item: "pH", Value: 9},
+		Measurement{Item: "COD", Value: 30})
+
+	// 让本次确认的本地保存失败：临时文件路径被占成目录，WriteFile 必然失败。
+	// 采样点、限值和样品都已在此前成功准备好，失败只发生在这一次确认的保存上。
+	tmp := filepath.Join(dir, "water-data.json.tmp")
+	if err := os.Mkdir(tmp, 0o755); err != nil {
+		t.Fatalf("block persist: %v", err)
+	}
+	_, err := s.Confirm("S2")
+	if err == nil {
+		t.Fatal("Confirm should return a save error when persist fails")
+	}
+	// 必须是保存错误，而不是缺限值、样品不存在等判定/录入错误：
+	// 两个项目在采样时都有适用上限，逐项判定已完成才会走到保存
+	for _, judgeErr := range []error{ErrMissingLimit, ErrUnknownSample, ErrVoided, ErrEmptyField, ErrClosed} {
+		if errors.Is(err, judgeErr) {
+			t.Fatalf("failure must be a save error, not a judgment/entry error %v: %v", judgeErr, err)
+		}
+	}
+	if err := os.Remove(tmp); err != nil {
+		t.Fatalf("restore persist: %v", err)
+	}
+
+	// 同一份打开的存放中按采样点查看：S2 仍是原样——
+	// 待判定、无逐项判定结果、无失败尝试产生的超标标记
+	list, err := s.ListByPoint("P1")
+	if err != nil {
+		t.Fatalf("ListByPoint: %v", err)
+	}
+	if len(list) != 2 || list[0].ID != "S2" || list[1].ID != "S1" {
+		t.Fatalf("list order/content wrong: %+v", list)
+	}
+	pending := list[0]
+	if pending.Status != StatusPending || pending.Results != nil || pending.Exceeded {
+		t.Fatalf("failed confirm must leave sample pending without results/exceeded flag: %+v", pending)
+	}
+	if !pending.SampledAt.Equal(at(5, 0)) ||
+		len(pending.Measurements) != 2 ||
+		pending.Measurements[0].Item != "pH" || pending.Measurements[0].Value != 9 ||
+		pending.Measurements[1].Item != "COD" || pending.Measurements[1].Value != 30 {
+		t.Fatalf("sampled time/items/values should be unchanged: %+v", pending)
+	}
+	// 原有已确认样品的结论和所用限值保持原样
+	old := list[1]
+	if old.Status != StatusConfirmed || old.Exceeded ||
+		len(old.Results) != 1 || old.Results[0].Item != "pH" ||
+		old.Results[0].Value != 7 || old.Results[0].Limit != 8.0 ||
+		!old.Results[0].LimitEffective.Equal(at(1, 0)) {
+		t.Fatalf("S1 must keep its confirmed conclusion and limit: %+v", old)
+	}
+
+	// 最近有效结果仍是之前那份已确认样品：不能因失败的样品采样更晚就把它作为最新结论
+	latest1, ok, err := s.LatestResult("P1")
+	if err != nil || !ok || latest1.ID != "S1" {
+		t.Fatalf("latest should still be S1, got %+v ok=%v err=%v", latest1, ok, err)
+	}
+
+	// 关闭后重新打开：失败尝试不能把部分判定结果写到盘上
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	disk, err := s2.ListByPoint("P1")
+	if err != nil {
+		t.Fatalf("ListByPoint after reopen: %v", err)
+	}
+	if len(disk) != 2 || disk[0].ID != "S2" {
+		t.Fatalf("reopened list wrong: %+v", disk)
+	}
+	if disk[0].Status != StatusPending || disk[0].Results != nil || disk[0].Exceeded {
+		t.Fatalf("disk must not carry partial results from failed confirm: %+v", disk[0])
+	}
+	if _, ok, err := s2.LatestResult("P1"); err != nil || !ok {
+		t.Fatalf("latest after reopen should still exist, ok=%v err=%v", ok, err)
+	}
+
+	// 恢复正常保存条件后再确认：应按采样当时适用的限值成功保存，
+	// 不能被当成已经确认而直接返回失败尝试的状态
+	smp, err := s2.Confirm("S2")
+	if err != nil {
+		t.Fatalf("Confirm S2 after restore: %v", err)
+	}
+	if smp.Status != StatusConfirmed || !smp.Exceeded {
+		t.Fatalf("S2 should be confirmed & exceeded: %+v", smp)
+	}
+	if len(smp.Results) != 2 {
+		t.Fatalf("expected item-by-item results for both measurements, got %+v", smp.Results)
+	}
+	// pH 9 > 8 超标；COD 30 == 30 达标（测量值大于上限才超标，等于不算）
+	r0, r1 := smp.Results[0], smp.Results[1]
+	if r0.Item != "pH" || r0.Value != 9 || r0.Limit != 8.0 ||
+		!r0.LimitEffective.Equal(at(1, 0)) || !r0.Exceeded {
+		t.Fatalf("pH judgment wrong: %+v", r0)
+	}
+	if r1.Item != "COD" || r1.Value != 30 || r1.Limit != 30.0 ||
+		!r1.LimitEffective.Equal(at(1, 0)) || r1.Exceeded {
+		t.Fatalf("COD equal to limit must pass: %+v", r1)
+	}
+
+	// 成功后按采样点查看的记录与最近有效结果应一致，
+	// 逐项核对测量值、所用上限、生效时间和各自的判定
+	list2, err := s2.ListByPoint("P1")
+	if err != nil {
+		t.Fatalf("ListByPoint after successful confirm: %v", err)
+	}
+	if len(list2) != 2 || list2[0].ID != "S2" ||
+		list2[0].Status != StatusConfirmed || !list2[0].Exceeded {
+		t.Fatalf("list should show S2 confirmed & exceeded: %+v", list2)
+	}
+	latest2, ok, err := s2.LatestResult("P1")
+	if err != nil || !ok || latest2.ID != "S2" {
+		t.Fatalf("latest should now be S2, got %+v ok=%v err=%v", latest2, ok, err)
+	}
+	for i, r := range latest2.Results {
+		lr := list2[0].Results[i]
+		if r.Item != lr.Item || r.Value != lr.Value || r.Limit != lr.Limit ||
+			!r.LimitEffective.Equal(lr.LimitEffective) || r.Exceeded != lr.Exceeded {
+			t.Fatalf("list and latest disagree on item %d: list=%+v latest=%+v", i, lr, r)
+		}
+	}
+}

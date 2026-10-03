@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -87,8 +88,15 @@ type Sample struct {
 // diskState 是落盘的完整数据。
 type diskState struct {
 	Points  map[string]SamplingPoint `json:"points"`
-	Limits  map[string][]Limit       `json:"limits"`
+	Limits  map[string][]Limit       `json:"limits"` // 键仅为落盘占位，读取时按每条限值自身的采样点与项目重新分组
 	Samples map[string]*Sample       `json:"samples"`
+}
+
+// limitGroup 用两个字段各自标识一组限值，避免把包含 U+0000 的文本
+// 用单字符拼接成键时不同组合撞成同一组。
+type limitGroup struct {
+	pointID string
+	item    string
 }
 
 // Store 是绑定到某个本地目录的取样判定数据存放。
@@ -99,7 +107,7 @@ type Store struct {
 	file    string
 	closed  bool
 	points  map[string]SamplingPoint
-	limits  map[string][]Limit // key: pointID + "\x00" + item，按生效时间升序
+	limits  map[limitGroup][]Limit // 按生效时间升序
 	samples map[string]*Sample
 }
 
@@ -115,7 +123,7 @@ func Open(dir string) (*Store, error) {
 		dir:     dir,
 		file:    filepath.Join(dir, "water-data.json"),
 		points:  map[string]SamplingPoint{},
-		limits:  map[string][]Limit{},
+		limits:  map[limitGroup][]Limit{},
 		samples: map[string]*Sample{},
 	}
 	data, err := os.ReadFile(s.file)
@@ -133,7 +141,19 @@ func Open(dir string) (*Store, error) {
 		s.points = st.Points
 	}
 	if st.Limits != nil {
-		s.limits = st.Limits
+		// 不按落盘键分组：键可能是旧版本用单字符拼接生成的，包含 U+0000 的
+		// 不同（采样点，项目）组合会共用同一个键。以每条限值自身的两个字段为准，
+		// 让曾经被错误合并的组在重新打开时也能各自归位。
+		for _, versions := range st.Limits {
+			for _, lim := range versions {
+				g := limitGroup{pointID: lim.PointID, item: lim.Item}
+				s.limits[g] = append(s.limits[g], lim)
+			}
+		}
+		for g, versions := range s.limits {
+			sort.Slice(versions, func(i, j int) bool { return versions[i].Effective.Before(versions[j].Effective) })
+			s.limits[g] = versions
+		}
 	}
 	if st.Samples != nil {
 		s.samples = st.Samples
@@ -154,7 +174,11 @@ func (s *Store) Close() error {
 
 func clean(s string) string { return strings.TrimSpace(s) }
 
-func limitKey(pointID, item string) string { return pointID + "\x00" + item }
+// diskLimitKey 生成仅用于落盘 JSON 的分组键。带上两个字段的长度前缀，
+// 任何包含 U+0000 的文本组合都不会撞键；读取时并不依赖该键分组。
+func diskLimitKey(pointID, item string) string {
+	return strconv.Itoa(len(pointID)) + ":" + pointID + strconv.Itoa(len(item)) + ":" + item
+}
 
 func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
@@ -168,9 +192,13 @@ func (s *Store) checkOpenLocked() error {
 // persistLocked 把全部数据原子写回数据文件。只在成功变更后调用，
 // 被拒绝的操作不会走到这里，因此不会留下新增或变更记录。
 func (s *Store) persistLocked() error {
+	diskLimits := make(map[string][]Limit, len(s.limits))
+	for g, versions := range s.limits {
+		diskLimits[diskLimitKey(g.pointID, g.item)] = versions
+	}
 	data, err := json.MarshalIndent(diskState{
 		Points:  s.points,
-		Limits:  s.limits,
+		Limits:  diskLimits,
 		Samples: s.samples,
 	}, "", "  ")
 	if err != nil {
@@ -229,23 +257,23 @@ func (s *Store) SetLimit(pointID, item string, value float64, effective time.Tim
 		return Limit{}, ErrInvalidTime
 	}
 	lim := Limit{PointID: pointID, Item: item, Value: value, Effective: effective.UTC()}
-	key := limitKey(pointID, item)
-	versions := s.limits[key]
+	g := limitGroup{pointID: pointID, item: item}
+	versions := s.limits[g]
 	for _, v := range versions {
 		if v.Effective.Equal(lim.Effective) {
 			return Limit{}, fmt.Errorf("%w: %s/%s @ %s", ErrDuplicateLimitTime, pointID, item, lim.Effective)
 		}
 	}
-	old := s.limits[key]
+	old := s.limits[g]
 	// 复制到新切片再插入排序：append/sort 会原地改动共享底层数组，
 	// 一旦保存失败需要回滚，old 必须仍是调用前的完整状态。
 	versions = make([]Limit, len(old)+1)
 	copy(versions, old)
 	versions[len(old)] = lim
 	sort.Slice(versions, func(i, j int) bool { return versions[i].Effective.Before(versions[j].Effective) })
-	s.limits[key] = versions
+	s.limits[g] = versions
 	if err := s.persistLocked(); err != nil {
-		s.limits[key] = old
+		s.limits[g] = old
 		return Limit{}, err
 	}
 	return lim, nil
@@ -353,7 +381,7 @@ func (s *Store) Confirm(id string) (Sample, error) {
 	results := make([]ItemResult, 0, len(smp.Measurements))
 	exceeded := false
 	for _, m := range smp.Measurements {
-		lim, ok := applicableLimit(s.limits[limitKey(smp.PointID, m.Item)], smp.SampledAt)
+		lim, ok := applicableLimit(s.limits[limitGroup{pointID: smp.PointID, item: m.Item}], smp.SampledAt)
 		if !ok {
 			return Sample{}, fmt.Errorf("%w: 样品 %s 的项目 %s", ErrMissingLimit, id, m.Item)
 		}

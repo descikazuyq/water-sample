@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -91,6 +92,14 @@ type diskState struct {
 	Samples map[string]*Sample       `json:"samples"`
 }
 
+// limitKey 把一条限值唯一归属到登记它的采样点和测量项目。
+// 两个字段各自完全相等才算同一组；用结构体做键，编号或项目里
+// 出现任何字符（包括 U+0000）都不会让不同组合撞成同一组。
+type limitKey struct {
+	pointID string
+	item    string
+}
+
 // Store 是绑定到某个本地目录的取样判定数据存放。
 // 不同目录的数据互不混用；关闭后重新打开仍能查看原有记录。
 type Store struct {
@@ -99,7 +108,7 @@ type Store struct {
 	file    string
 	closed  bool
 	points  map[string]SamplingPoint
-	limits  map[string][]Limit // key: pointID + "\x00" + item，按生效时间升序
+	limits  map[limitKey][]Limit // 每组内按生效时间升序
 	samples map[string]*Sample
 }
 
@@ -115,7 +124,7 @@ func Open(dir string) (*Store, error) {
 		dir:     dir,
 		file:    filepath.Join(dir, "water-data.json"),
 		points:  map[string]SamplingPoint{},
-		limits:  map[string][]Limit{},
+		limits:  map[limitKey][]Limit{},
 		samples: map[string]*Sample{},
 	}
 	data, err := os.ReadFile(s.file)
@@ -133,7 +142,18 @@ func Open(dir string) (*Store, error) {
 		s.points = st.Points
 	}
 	if st.Limits != nil {
-		s.limits = st.Limits
+		// 不沿用文件里的 map 键，而以每条 Limit 自身记录的采样点和项目
+		// 重新分组：旧版本文件用拼接字符串做键，含 U+0000 的不同组合可能
+		// 被并进同一键下，Limit 结构体里的两个字段始终是登记时的原文。
+		for _, versions := range st.Limits {
+			for _, lim := range versions {
+				k := limitKey{pointID: lim.PointID, item: lim.Item}
+				s.limits[k] = append(s.limits[k], lim)
+			}
+		}
+		for _, versions := range s.limits {
+			sort.Slice(versions, func(i, j int) bool { return versions[i].Effective.Before(versions[j].Effective) })
+		}
 	}
 	if st.Samples != nil {
 		s.samples = st.Samples
@@ -154,7 +174,12 @@ func (s *Store) Close() error {
 
 func clean(s string) string { return strings.TrimSpace(s) }
 
-func limitKey(pointID, item string) string { return pointID + "\x00" + item }
+// diskLimitKey 是限值分组在数据文件里的键。用长度前缀编码，
+// 不同的（采样点, 项目）组合一定得到不同的键，字段原文不做任何改写。
+// 读取时不解析此键（以 Limit 自身字段为准），它只保证落盘不丢组。
+func diskLimitKey(k limitKey) string {
+	return strconv.Itoa(len(k.pointID)) + ":" + k.pointID + k.item
+}
 
 func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
@@ -168,9 +193,13 @@ func (s *Store) checkOpenLocked() error {
 // persistLocked 把全部数据原子写回数据文件。只在成功变更后调用，
 // 被拒绝的操作不会走到这里，因此不会留下新增或变更记录。
 func (s *Store) persistLocked() error {
+	limits := make(map[string][]Limit, len(s.limits))
+	for k, versions := range s.limits {
+		limits[diskLimitKey(k)] = versions
+	}
 	data, err := json.MarshalIndent(diskState{
 		Points:  s.points,
-		Limits:  s.limits,
+		Limits:  limits,
 		Samples: s.samples,
 	}, "", "  ")
 	if err != nil {
@@ -229,7 +258,7 @@ func (s *Store) SetLimit(pointID, item string, value float64, effective time.Tim
 		return Limit{}, ErrInvalidTime
 	}
 	lim := Limit{PointID: pointID, Item: item, Value: value, Effective: effective.UTC()}
-	key := limitKey(pointID, item)
+	key := limitKey{pointID: pointID, item: item}
 	versions := s.limits[key]
 	for _, v := range versions {
 		if v.Effective.Equal(lim.Effective) {
@@ -353,7 +382,7 @@ func (s *Store) Confirm(id string) (Sample, error) {
 	results := make([]ItemResult, 0, len(smp.Measurements))
 	exceeded := false
 	for _, m := range smp.Measurements {
-		lim, ok := applicableLimit(s.limits[limitKey(smp.PointID, m.Item)], smp.SampledAt)
+		lim, ok := applicableLimit(s.limits[limitKey{pointID: smp.PointID, item: m.Item}], smp.SampledAt)
 		if !ok {
 			return Sample{}, fmt.Errorf("%w: 样品 %s 的项目 %s", ErrMissingLimit, id, m.Item)
 		}

@@ -633,6 +633,143 @@ func TestListAndLatest(t *testing.T) {
 	}
 }
 
+// 编号或项目中间含 U+0000 时，不同的（采样点, 项目）组合也必须各自独立：
+// 限值只归属登记它的那一组，互不报生效时间重复，互不借用上限。
+func TestLimitGroupsWithNUL(t *testing.T) {
+	s, dir := open(t)
+	p1, i1 := "P\x00A", "B" // 组合一：编号 P〈零〉A，项目 B
+	p2, i2 := "P", "A\x00B" // 组合二：编号 P，项目 A〈零〉B
+	mustPoint(t, s, p1, "甲")
+	mustPoint(t, s, p2, "乙")
+
+	// 同一时刻分别登记上限 10 和 5，互不报重复
+	mustLimit(t, s, p1, i1, 10.0, at(1, 0))
+	mustLimit(t, s, p2, i2, 5.0, at(1, 0))
+
+	// 两组各有多个版本：组一 9/5 生效 20，组二 9/5 生效 4；
+	// 另一组更晚生效的版本不影响本组选择
+	mustLimit(t, s, p1, i1, 20.0, at(5, 0))
+	mustLimit(t, s, p2, i2, 4.0, at(5, 0))
+
+	// 同一组以另一时区表示同一生效时刻，仍报重复且不覆盖原值
+	same := time.Date(2026, 9, 5, 8, 0, 0, 0, time.FixedZone("CST", 8*3600)) // == at(5,0) UTC
+	if _, err := s.SetLimit(p1, i1, 99.0, same); !errors.Is(err, ErrDuplicateLimitTime) {
+		t.Fatalf("same instant in another zone should be duplicate, got %v", err)
+	}
+
+	// 采样晚于 9/1 早于 9/5：组一用 10（值 7 达标），组二用 5（值 7 超标）
+	mustSample(t, s, "S1", p1, at(3, 0), Measurement{Item: i1, Value: 7})
+	mustSample(t, s, "S2", p2, at(3, 0), Measurement{Item: i2, Value: 7})
+	smp1, err := s.Confirm("S1")
+	if err != nil {
+		t.Fatalf("Confirm S1: %v", err)
+	}
+	smp2, err := s.Confirm("S2")
+	if err != nil {
+		t.Fatalf("Confirm S2: %v", err)
+	}
+	if smp1.Exceeded || smp1.Results[0].Exceeded {
+		t.Fatalf("group 1: 7 <= 10 should pass, got %+v", smp1.Results[0])
+	}
+	if !smp2.Exceeded || !smp2.Results[0].Exceeded {
+		t.Fatalf("group 2: 7 > 5 should exceed, got %+v", smp2.Results[0])
+	}
+	// 逐项结果保留本组的项目名、测量值、所用上限及其生效时间
+	r1, r2 := smp1.Results[0], smp2.Results[0]
+	if r1.Item != i1 || r1.Value != 7 || r1.Limit != 10.0 || !r1.LimitEffective.Equal(at(1, 0)) {
+		t.Fatalf("group 1 result wrong: %+v", r1)
+	}
+	if r2.Item != i2 || r2.Value != 7 || r2.Limit != 5.0 || !r2.LimitEffective.Equal(at(1, 0)) {
+		t.Fatalf("group 2 result wrong: %+v", r2)
+	}
+
+	// 采样时间恰好等于生效时间时使用该版；测量值等于上限仍算达标
+	mustSample(t, s, "S3", p1, at(5, 0), Measurement{Item: i1, Value: 20})
+	smp3, err := s.Confirm("S3")
+	if err != nil {
+		t.Fatalf("Confirm S3: %v", err)
+	}
+	if smp3.Results[0].Limit != 20.0 || !smp3.Results[0].LimitEffective.Equal(at(5, 0)) || smp3.Exceeded {
+		t.Fatalf("boundary version/equal value wrong: %+v", smp3.Results[0])
+	}
+	// 组二 9/5 版为 4，与组一同刻生效但不影响组一；组二值 4 等于上限达标
+	mustSample(t, s, "S4", p2, at(5, 0), Measurement{Item: i2, Value: 4})
+	smp4, err := s.Confirm("S4")
+	if err != nil {
+		t.Fatalf("Confirm S4: %v", err)
+	}
+	if smp4.Results[0].Limit != 4.0 || smp4.Exceeded {
+		t.Fatalf("group 2 boundary wrong: %+v", smp4.Results[0])
+	}
+
+	// 未登记限值的组合必须拒绝确认、保持待判定，
+	// 不能借用已有组的限值，也不留部分结果
+	mustSample(t, s, "S5", p2, at(3, 0), Measurement{Item: i1, Value: 1})
+	if _, err := s.Confirm("S5"); !errors.Is(err, ErrMissingLimit) {
+		t.Fatalf("unregistered group must not borrow limits, got %v", err)
+	}
+	list, err := s.ListByPoint(p2)
+	if err != nil {
+		t.Fatalf("ListByPoint: %v", err)
+	}
+	var s5 *Sample
+	for i := range list {
+		if list[i].ID == "S5" {
+			s5 = &list[i]
+		}
+	}
+	if s5 == nil || s5.Status != StatusPending || s5.Results != nil || s5.Exceeded {
+		t.Fatalf("rejected confirm must stay pending without partial results: %+v", s5)
+	}
+
+	// 按采样点查看能看到正确的判定依据
+	list1, err := s.ListByPoint(p1)
+	if err != nil {
+		t.Fatalf("ListByPoint p1: %v", err)
+	}
+	var seenS1 bool
+	for _, smp := range list1 {
+		if smp.ID == "S1" {
+			seenS1 = true
+			if smp.Results[0].Item != i1 || smp.Results[0].Limit != 10.0 || smp.Exceeded {
+				t.Fatalf("list view of S1 wrong: %+v", smp.Results[0])
+			}
+		}
+	}
+	if !seenS1 {
+		t.Fatalf("S1 missing from p1 list: %+v", list1)
+	}
+
+	// 重新打开后两组仍然各自独立
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	if _, err := s2.SetLimit(p2, i2, 6.0, at(1, 0)); !errors.Is(err, ErrDuplicateLimitTime) {
+		t.Fatalf("reopened: group 2 duplicate time should be rejected, got %v", err)
+	}
+	if _, err := s2.SetLimit(p1, i1, 6.0, at(2, 0)); err != nil {
+		t.Fatalf("reopened: group 1 new version should succeed, got %v", err)
+	}
+	mustSample(t, s2, "S6", p1, at(3, 0), Measurement{Item: i1, Value: 7})
+	smp6, err := s2.Confirm("S6")
+	if err != nil {
+		t.Fatalf("reopened Confirm S6: %v", err)
+	}
+	if smp6.Results[0].Limit != 6.0 || !smp6.Exceeded {
+		t.Fatalf("reopened: group 1 should use its own 6.0, got %+v", smp6.Results[0])
+	}
+	// 已确认样品保留原结论与所用限值，不因修复或新限值重新判定
+	keep, err := s2.Confirm("S1")
+	if err != nil || keep.Results[0].Limit != 10.0 || keep.Exceeded {
+		t.Fatalf("confirmed result must not change, got %+v err=%v", keep.Results[0], err)
+	}
+}
+
 func TestPersistenceAndIsolation(t *testing.T) {
 	s, dir := open(t)
 	mustPoint(t, s, "P1", "取水口")

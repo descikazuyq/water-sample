@@ -267,6 +267,181 @@ func TestSubmitSample(t *testing.T) {
 	}
 }
 
+// 新样品提交内容合法、但本地保存失败时，本次录入必须整体失败：
+// 返回保存错误和空样品，不能返回带编号的待判定记录；按采样点查看仍只有
+// 此前成功保存的样品，对失败编号确认应报样品不存在；较早的已确认样品
+// 其原始测量、确认状态、逐项所用上限与生效时间、整份结论全部保持原样。
+// 保存条件未恢复时同编号同内容重提仍因保存失败被拒绝，不能走已有样品的
+// 幂等返回；恢复后允许用该编号改值重新录入，作为首次成功保存，且失败尝试
+// 的内容不能被随后的成功操作顺带落盘。
+func TestSubmitSamplePersistFailure(t *testing.T) {
+	s, dir := open(t)
+	mustPoint(t, s, "P1", "取水口")
+	mustLimit(t, s, "P1", "pH", 8.0, at(1, 0))
+	mustLimit(t, s, "P1", "COD", 30.0, at(1, 0))
+
+	// 较早采样、正常保存的已确认样品：pH 7 ≤ 8，达标
+	mustSample(t, s, "S1", "P1", at(5, 0), Measurement{Item: "pH", Value: 7})
+	conf1, err := s.Confirm("S1")
+	if err != nil || conf1.Status != StatusConfirmed || conf1.Exceeded {
+		t.Fatalf("Confirm S1 setup: %+v err=%v", conf1, err)
+	}
+	// 较早样品的完整应有内容，失败提交前后都不能变
+	checkS1 := func(smp Sample, label string) {
+		t.Helper()
+		if smp.ID != "S1" || smp.PointID != "P1" || smp.Status != StatusConfirmed || smp.VoidReason != "" {
+			t.Fatalf("%s: S1 基本字段被改动: %+v", label, smp)
+		}
+		if !smp.SampledAt.Equal(at(5, 0)) || smp.Exceeded {
+			t.Fatalf("%s: S1 采样时间或整份结论被改动: %+v", label, smp)
+		}
+		if len(smp.Measurements) != 1 || smp.Measurements[0].Item != "pH" || smp.Measurements[0].Value != 7 {
+			t.Fatalf("%s: S1 原始测量被改动: %+v", label, smp.Measurements)
+		}
+		if len(smp.Results) != 1 {
+			t.Fatalf("%s: S1 判定结果被改动: %+v", label, smp.Results)
+		}
+		if r := smp.Results[0]; r.Item != "pH" || r.Value != 7 || r.Limit != 8.0 ||
+			!r.LimitEffective.Equal(at(1, 0)) || r.Exceeded {
+			t.Fatalf("%s: S1 逐项所用上限或生效时间被改动: %+v", label, r)
+		}
+	}
+
+	// 只让新样品的保存失败：采样点、限值和 S1 此前均已成功落盘。
+	// 占用临时文件路径为目录后，原子写的 WriteFile 必然失败，不依赖目录权限。
+	tmp := filepath.Join(dir, "water-data.json.tmp")
+	if err := os.Mkdir(tmp, 0o755); err != nil {
+		t.Fatalf("block persist: %v", err)
+	}
+
+	// 同样无法保存的条件下，同一份提交内项目重复仍在保存之前的校验阶段
+	// 以 ErrDuplicateItem 拒绝；合法提交的保存失败是另一种错误，二者不能混同。
+	if _, err := s.SubmitSample("S2", "P1", at(10, 0),
+		Measurement{Item: " pH ", Value: 9}, Measurement{Item: "pH", Value: 8}); !errors.Is(err, ErrDuplicateItem) {
+		t.Fatalf("duplicate item should be rejected before save, got %v", err)
+	}
+
+	// 合法提交（编号全新、采样更晚、两个项目各一个有限测量值）走到保存阶段后失败：
+	// 必须返回保存错误和空样品，不能返回带编号的待判定记录。
+	failedMs := []Measurement{{Item: "pH", Value: 9}, {Item: "COD", Value: 30}}
+	got, err := s.SubmitSample("S2", "P1", at(10, 0), failedMs...)
+	if err == nil {
+		t.Fatal("SubmitSample should fail when the new sample cannot be saved")
+	}
+	for _, target := range []error{ErrDuplicateItem, ErrSampleConflict, ErrUnknownPoint, ErrInvalidValue} {
+		if errors.Is(err, target) {
+			t.Fatalf("save failure must not be reported as %v: %v", target, err)
+		}
+	}
+	if got.ID != "" || got.Status == StatusPending {
+		t.Fatalf("failed save must return an empty sample, got %+v", got)
+	}
+
+	// 保存条件未恢复：同编号、同内容再次提交仍因保存失败被拒绝，
+	// 不能走已有样品的重复提交行为而返回成功。
+	if again, err := s.SubmitSample("S2", "P1", at(10, 0), failedMs...); err == nil {
+		t.Fatalf("resubmit while save still failing must not succeed, got %+v", again)
+	}
+
+	// 按采样点查看仍只有此前成功保存的 S1，失败提交不留记录
+	list, err := s.ListByPoint("P1")
+	if err != nil || len(list) != 1 {
+		t.Fatalf("ListByPoint after failed save should keep only S1: %+v err=%v", list, err)
+	}
+	checkS1(list[0], "失败后按点查看")
+
+	// 对失败提交的编号请求确认：明确报样品不存在，
+	// 不能转而开始判定，也不能报缺少上限。
+	if _, err := s.Confirm("S2"); !errors.Is(err, ErrUnknownSample) {
+		t.Fatalf("confirming a sample that was never saved should report unknown, got %v", err)
+	}
+
+	// 最近有效结果仍指向较早的 S1，结论与逐项依据保持原样
+	latest, ok, err := s.LatestResult("P1")
+	if err != nil || !ok || latest.ID != "S1" {
+		t.Fatalf("latest valid result should stay S1, got %+v ok=%v err=%v", latest, ok, err)
+	}
+	checkS1(latest, "失败后最近有效结果")
+
+	// 恢复正常保存条件
+	if err := os.Remove(tmp); err != nil {
+		t.Fatalf("restore persist: %v", err)
+	}
+
+	// 允许继续使用该编号录入，并把其中一个测量值改为另一个有限数：
+	// 必须作为首次成功录入接受，不能因前一次失败内容不同而报冲突。
+	saved, err := s.SubmitSample("S2", "P1", at(10, 0),
+		Measurement{Item: "pH", Value: 9}, Measurement{Item: "COD", Value: 25})
+	if errors.Is(err, ErrSampleConflict) {
+		t.Fatalf("failed attempt must not conflict with the retry: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("retry SubmitSample after save restored: %v", err)
+	}
+	if saved.ID != "S2" || saved.Status != StatusPending || saved.Results != nil || saved.VoidReason != "" {
+		t.Fatalf("retry should be saved as a fresh pending sample, got %+v", saved)
+	}
+
+	// 查询中只出现一份该编号的待判定样品，两个项目及数值以本次成功提交为准
+	checkS2 := func(smp Sample, label string) {
+		t.Helper()
+		if smp.ID != "S2" || smp.PointID != "P1" || smp.Status != StatusPending {
+			t.Fatalf("%s: S2 基本字段或状态错误: %+v", label, smp)
+		}
+		if !smp.SampledAt.Equal(at(10, 0)) || smp.Exceeded || smp.Results != nil || smp.VoidReason != "" {
+			t.Fatalf("%s: S2 不应有判定结果或作废原因: %+v", label, smp)
+		}
+		if len(smp.Measurements) != 2 {
+			t.Fatalf("%s: S2 测量项目数量错误: %+v", label, smp.Measurements)
+		}
+		values := map[string]float64{}
+		for _, m := range smp.Measurements {
+			values[m.Item] = m.Value
+		}
+		if values["pH"] != 9 || values["COD"] != 25 {
+			t.Fatalf("%s: S2 数值应以成功提交为准（失败尝试的 30 不得混入）: %+v", label, smp.Measurements)
+		}
+	}
+	list, err = s.ListByPoint("P1")
+	if err != nil || len(list) != 2 {
+		t.Fatalf("ListByPoint after recovery: %+v err=%v", list, err)
+	}
+	checkS2(list[0], "恢复后按点查看") // 采样更晚，排在最前
+	checkS1(list[1], "恢复后按点查看")
+
+	// 已成功保存的样品保持公开入口的重复提交行为：同内容幂等返回，不同内容拒绝
+	again, err := s.SubmitSample("S2", "P1", at(10, 0),
+		Measurement{Item: "COD", Value: 25}, Measurement{Item: "pH", Value: 9})
+	if err != nil || again.ID != "S2" || again.Status != StatusPending {
+		t.Fatalf("idempotent resubmit of the saved sample: %+v err=%v", again, err)
+	}
+	if _, err := s.SubmitSample("S2", "P1", at(10, 0),
+		Measurement{Item: "pH", Value: 9}, Measurement{Item: "COD", Value: 26}); !errors.Is(err, ErrSampleConflict) {
+		t.Fatalf("conflicting resubmit of the saved sample should be rejected, got %v", err)
+	}
+
+	// 重新打开同一数据存放：成功提交的内容仍在，失败尝试的测量值没有混入记录
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	list, err = s2.ListByPoint("P1")
+	if err != nil || len(list) != 2 {
+		t.Fatalf("reopened ListByPoint: %+v err=%v", list, err)
+	}
+	checkS2(list[0], "重开后按点查看")
+	checkS1(list[1], "重开后按点查看")
+	latest, ok, err = s2.LatestResult("P1")
+	if err != nil || !ok || latest.ID != "S1" {
+		t.Fatalf("reopened latest valid result should still be S1, got %+v ok=%v err=%v", latest, ok, err)
+	}
+	checkS1(latest, "重开后最近有效结果")
+}
+
 func TestConfirm(t *testing.T) {
 	s, _ := open(t)
 	mustPoint(t, s, "P1", "取水口")

@@ -465,15 +465,7 @@ func (s *Store) ListByPoint(pointID string) ([]Sample, error) {
 	if err := s.checkOpenLocked(); err != nil {
 		return nil, err
 	}
-	pointID = clean(pointID)
-	var list []Sample
-	for _, smp := range s.samples {
-		if smp.PointID == pointID {
-			list = append(list, copySample(smp))
-		}
-	}
-	sortSamples(list)
-	return list, nil
+	return s.pointSamplesLocked(clean(pointID), func(*Sample) bool { return true }), nil
 }
 
 // LatestResult 返回该采样点最近有效的已确认样品（跳过待判定与已作废）。
@@ -484,18 +476,27 @@ func (s *Store) LatestResult(pointID string) (smp Sample, ok bool, err error) {
 	if err := s.checkOpenLocked(); err != nil {
 		return Sample{}, false, err
 	}
-	pointID = clean(pointID)
-	var list []Sample
-	for _, s := range s.samples {
-		if s.PointID == pointID && s.Status == StatusConfirmed {
-			list = append(list, copySample(s))
-		}
-	}
+	list := s.pointSamplesLocked(clean(pointID), func(smp *Sample) bool {
+		return smp.Status == StatusConfirmed
+	})
 	if len(list) == 0 {
 		return Sample{}, false, nil
 	}
-	sortSamples(list)
 	return list[0], true, nil
+}
+
+// pointSamplesLocked 收集某采样点符合 keep 的样品，逐份复制后按统一规则排列，
+// 供 ListByPoint 与 LatestResult 共用，保证两种查询对同一批样品的先后判断一致。
+// 调用方须已持有锁；pointID 须已做首尾空白处理。
+func (s *Store) pointSamplesLocked(pointID string, keep func(*Sample) bool) []Sample {
+	var list []Sample
+	for _, smp := range s.samples {
+		if smp.PointID == pointID && keep(smp) {
+			list = append(list, copySample(smp))
+		}
+	}
+	sortSamples(list)
+	return list
 }
 
 func sortSamples(list []Sample) {

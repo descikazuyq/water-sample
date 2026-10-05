@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Status 表示样品所处的判定状态。
@@ -42,6 +43,7 @@ var (
 	ErrMissingLimit       = errors.New("water: 存在找不到适用上限的测量项目")
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
+	ErrInvalidText        = errors.New("water: 样品编号、采样点编号或项目名不是合法的 UTF-8 文本")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -182,6 +184,13 @@ func diskLimitKey(pointID, item string) string {
 
 func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
+// invalidUTF8 报告文本是否无法作为合法 UTF-8 原样保存。必须在任何处理之前检查
+// 提交的原始文本：落盘 JSON 会把非法字节（孤立的 0xFF、0xFE、不完整的多字节
+// 序列等）静默替换成 U+FFFD，返回记录与保存内容会因此对不上，两个不同编号也
+// 可能变成同一文本。真正的 U+FFFD（“�”）以及中文、U+0000 等都是合法字符，
+// 不在拒绝之列；只在去首尾空白之外不做任何字符替换或归一化。
+func invalidUTF8(s string) bool { return !utf8.ValidString(s) }
+
 func (s *Store) checkOpenLocked() error {
 	if s.closed {
 		return ErrClosed
@@ -280,13 +289,29 @@ func (s *Store) SetLimit(pointID, item string, value float64, effective time.Tim
 }
 
 // SubmitSample 录入一份样品，初始为待判定状态。
-// 再次提交同一编号且内容相同（项目排列顺序不同不算变化）返回原样品；
+// 样品编号、采样点编号和每个项目名必须是合法的 UTF-8 文本：任一字段含孤立的
+// 0xFF、0xFE 字节或不完整的多字节序列等无法原样保存的内容时，整份提交以
+// ErrInvalidText 拒绝，不留部分记录，也不占用编号；真正的 U+FFFD（“�”）
+// 仍是合法字符。再次提交同一编号且内容相同（项目排列顺序不同不算变化）返回原样品；
 // 任一内容不同则拒绝整个提交，已确认或已作废的样品同样遵守。
 func (s *Store) SubmitSample(id, pointID string, sampledAt time.Time, measurements ...Measurement) (Sample, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkOpenLocked(); err != nil {
 		return Sample{}, err
+	}
+	// 在去首尾空白和其它任何处理之前检查原始文本：落盘 JSON 会把非法 UTF-8
+	// 静默替换成 U+FFFD，只有整份拒绝才能保证返回记录、按点查看与保存数据一致。
+	// 即使编号已被已有样品占用、非法项目排在最后，或提交同时存在其它内容问题，
+	// 也必须报告编码问题：不能归为未知采样点、项目重复或同编号冲突，更不能走
+	// 重复录入成功的分支。
+	if invalidUTF8(id) || invalidUTF8(pointID) {
+		return Sample{}, ErrInvalidText
+	}
+	for _, m := range measurements {
+		if invalidUTF8(m.Item) {
+			return Sample{}, ErrInvalidText
+		}
 	}
 	id, pointID = clean(id), clean(pointID)
 	if id == "" || pointID == "" {

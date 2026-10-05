@@ -44,7 +44,7 @@ var (
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
 	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
-	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少原测量、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值或超标标记与保存的判定依据不一致的损坏样品记录")
+	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少原测量、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值或上限生效依据、上限生效时间晚于采样时间或超标标记与保存的判定依据不一致的损坏样品记录")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -129,19 +129,32 @@ type Store struct {
 // 与原测量值一致（零是合法测量值，不会被当成缺项）。每条逐项判定还必须实际
 // 保存了上限数值：limit 字段缺失或保存为 null 都是判定依据残缺，即使读出
 // 的零值与测量值、超标标记恰好对得上，也不能当成“零等于零”的合法结论；
-// 明确保存数值零的上限仍是合法依据，负数和正数上限也保持原有行为。两个列表
+// 明确保存数值零的上限仍是合法依据，负数和正数上限也保持原有行为。每条逐项
+// 判定还必须实际保存了上限生效时间，且该时间不晚于这份样品的采样时间：
+// limitEffective 字段缺失、保存为 null 或读出 Go 的零时间，都表示缺少生效
+// 依据，不能当成一版很早以前就生效的上限放行；生效时间晚于采样时间的判定
+// 同样残缺——采样当时该版上限尚未生效，即使测量值、上限与超标标记三者恰好
+// 互相对得上（例如测量值 4、上限 5、标记达标，而该版上限要到采样次日才生效），
+// 也不能把这份结论当成有效结果。时间先后只按真实时刻判断并保留纳秒精度：
+// 生效时间恰好等于采样时间可以接受，晚一纳秒也必须拒绝；不同时区的写法若
+// 表示同一时刻，按相等处理。两个列表
 // 排列顺序不同不影响对应，成功读入后测量与判定各自保留原顺序。最后核对超标
 // 标记与该样品已保存的判定依据一致：每条判定的超标标记必须严格符合该条保存
 // 的测量值与上限——测量值严格大于上限才是超标，小于或等于（包括等于、零与
 // 负数的合法组合）都应为达标；整份样品的超标标记必须与逐项结论一致，任一
 // 项超标就应为真、全部达标就应为假。只核对本文件里已保存的依据，不重新选择
-// 当前限值、不重做判定。任一份样品对不上，整次打开以可被
+// 当前限值、不重做判定：生效时间核对也只对照这份样品自己保存的依据与采样时间，
+// 不要求它仍是当前登记限值中最新的一版，后来补录采样之前生效的新上限不影响
+// 旧结论的读入。任一份样品对不上，整次打开以可被
 // errors.Is(err, ErrCorruptRecord) 识别的错误失败，返回 nil 数据存放，
 // 错误信息点到具体样品编号与缺少原测量的原因（或具体项目）；判定缺少上限
-// 数值时点到具体项目；单项超标标记有误时点到具体项目，整份标记有误时说明
+// 数值时点到具体项目；判定缺少上限生效时间时点到具体项目并说明生效时间缺失，
+// 生效时间晚于采样时间时点到具体项目并带出两处真实时刻（保留足以说明先后的
+// 小数秒）；单项超标标记有误时点到具体项目，整份标记有误时说明
 // 它与逐项结论不一致；不会静默跳过问题样品、不会择一保留或合并重复测量、
-// 不会补出缺失测量、判定或上限数值、不会修正超标标记或重新判定、不会把它
-// 改成另一种状态、也不会把拒绝推迟到请求确认时，更不会改写原文件。待判定
+// 不会补出缺失测量、判定、上限数值或生效时间、不会替换成另一版上限、不会
+// 修正超标标记或重新判定、不会把它改成另一种状态（包括退回待判定）、不会把
+// 拒绝推迟到请求确认时，更不会改写原文件。待判定
 // 样品没有判定记录、待判定后作废的样品没有历史依据，均属正常，只要原测量
 // 完整就照常读入，不要求它们提前保存判定上限。
 // 完整记录原样读入，已保存的上限、生效时间、逐项结论与整份超标标记保留，不因
@@ -193,10 +206,10 @@ func Open(dir string) (*Store, error) {
 	if st.Samples != nil {
 		// 逐份校验后才整体接收：任何状态的样品都必须至少保留一个原测量，
 		// 原测量项目名重复也都是损坏，带结论的样品还要求逐项判定与原测量
-		// 完整对应、每条判定都实际保存了上限数值。任一份样品不通过，整次
-		// 打开都失败，不返回数据存放对象，也不静默跳过、择一保留、补测量、
-		// 补判定、补上限或回写原文件。
-		missingLimit, err := missingResultLimits(data)
+		// 完整对应、每条判定都实际保存了上限数值与不晚于采样时间的生效依据。
+		// 任一份样品不通过，整次打开都失败，不返回数据存放对象，也不静默
+		// 跳过、择一保留、补测量、补判定、补上限（数值或生效时间）或回写原文件。
+		missingFields, err := missingResultFields(data)
 		if err != nil {
 			return nil, fmt.Errorf("water: 读取数据文件失败: %w", err)
 		}
@@ -206,7 +219,7 @@ func Open(dir string) (*Store, error) {
 		}
 		sort.Strings(ids)
 		for _, id := range ids {
-			if err := validateLoadedSample(id, st.Samples[id], missingLimit[id]); err != nil {
+			if err := validateLoadedSample(id, st.Samples[id], missingFields[id]); err != nil {
 				return nil, err
 			}
 		}
@@ -215,35 +228,52 @@ func Open(dir string) (*Store, error) {
 	return s, nil
 }
 
-// missingResultLimits 重新扫描数据文件，找出每份样品的逐项判定中 limit 字段
-// 缺失或保存为 null 的测量项目。JSON 反序列化把字段缺失与 null 都落成 float64
-// 零值，与明确保存的零上限无法区分，因此“有没有保存上限”只能在读取时按字段
-// 是否存在单独核对；明确写出数值零（以及负数、正数）的上限不在此列。
-// 返回的 map 以落盘样品编号为键，键内是缺少上限数值的项目名集合。
-func missingResultLimits(data []byte) (map[string]map[string]bool, error) {
+// missingResultFields 重新扫描数据文件，找出每份样品的逐项判定中 limit 或
+// limitEffective 字段缺失或保存为 null 的测量项目。JSON 反序列化把字段缺失与
+// null 都落成零值：float64 零值与明确保存的零上限无法区分，time.Time 零值则与
+// 文件中 "0001-01-01T00:00:00Z" 这样的显式零时间写法无法区分；因此“有没有
+// 保存”只能在读取时按字段是否存在单独核对。明确写出数值零（以及负数、正数）
+// 的上限，以及明确写出的 Go 零时间串，都算“有保存”，由后续校验按值处理——
+// 显式零时间不是有效的生效依据。返回的 map 以落盘样品编号为键，键内按项目名
+// 标出缺少 limit / limitEffective 字段的判定。
+func missingResultFields(data []byte) (map[string]map[string]resultMissing, error) {
 	var probe struct {
 		Samples map[string]struct {
 			Results []struct {
-				Item  string   `json:"item"`
-				Limit *float64 `json:"limit"`
+				Item           string     `json:"item"`
+				Limit          *float64   `json:"limit"`
+				LimitEffective *time.Time `json:"limitEffective"`
 			} `json:"results"`
 		} `json:"samples"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return nil, err
 	}
-	missing := map[string]map[string]bool{}
+	missing := map[string]map[string]resultMissing{}
 	for key, smp := range probe.Samples {
 		for _, r := range smp.Results {
+			var m resultMissing
 			if r.Limit == nil {
+				m.limit = true
+			}
+			if r.LimitEffective == nil {
+				m.effective = true
+			}
+			if m.limit || m.effective {
 				if missing[key] == nil {
-					missing[key] = map[string]bool{}
+					missing[key] = map[string]resultMissing{}
 				}
-				missing[key][r.Item] = true
+				missing[key][r.Item] = m
 			}
 		}
 	}
 	return missing, nil
+}
+
+// resultMissing 标记一条逐项判定在落盘 JSON 中缺少哪些依据字段。
+type resultMissing struct {
+	limit     bool
+	effective bool
 }
 
 // validateLoadedSample 校验一份从本地文件读入的样品记录。
@@ -268,11 +298,25 @@ func missingResultLimits(data []byte) (map[string]map[string]bool, error) {
 // 顺序无关。
 //
 // 每条逐项判定还必须实际保存了上限数值：本地数据中该条判定的 limit 字段缺失，
-// 或字段值为 null，都视为判定依据残缺（missingLimit 由 missingResultLimits 按
-// 字段是否存在探出）。即使读出的零值与测量值、超标标记恰好互相对应，也不能把
+// 或字段值为 null，都视为判定依据残缺（missing 由 missingResultFields 按字段
+// 是否存在探出）。即使读出的零值与测量值、超标标记恰好互相对应，也不能把
 // 它当成“零等于零”的合法结论；明确保存数值零的上限仍是合法依据，负数和正数
 // 上限也保持原有行为，不把零当成缺项。不补成零、不从登记的限值中找值填上、
 // 不重新判定。多项目样品只有一项缺少上限，同样整份拒绝。
+//
+// 每条逐项判定还必须实际保存上限生效时间，且该时间不晚于这份样品的采样时间。
+// 与上限数值一样，limitEffective 字段缺失或保存为 null（missing.effective 由
+// missingResultFields 探出）都算缺少生效依据；字段存在但读出 Go 零时间
+// （文件中显式写成 0001-01-01T00:00:00Z 等零时间串也是同样的值）同样表示
+// 没有一版真实存在的生效时刻，不能把零时间当成“很早以前”放行。字段存在且
+// 非零时，生效时刻不得晚于采样时刻：采样当时该版上限必须已经生效，否则即使
+// 测量值、上限数值与超标标记互相对得上，这份结论也是用采样之后才生效的上限
+// 作出的，必须整份拒绝。先后按真实时刻判断并保留纳秒精度：生效时刻恰好等于
+// 采样时刻可以接受，晚一纳秒也拒绝；不同时区写法表示同一时刻时按相等处理。
+// 不补填日期、不替换成登记限值中的另一版、不重新判定。只核对该样品自己保存
+// 的依据与采样时间：它不必是当前登记版本中最新的一版，后来补录采样之前生效
+// 的新上限不影响旧结论原样读入。多项目样品只有一项生效时间不合法，同样整份
+// 拒绝。
 //
 // 对应关系与上限数值都通过后，超标标记还必须与这份样品已保存的判定依据一致：每条判定的
 // Exceeded 必须严格等于“该条保存的测量值 > 该条保存的上限”，测量值小于或等于
@@ -281,9 +325,9 @@ func missingResultLimits(data []byte) (map[string]map[string]bool, error) {
 // 不按当前限值重新选择上限、不重做判定，因此后来补录的限值即使会使结论改变，
 // 也不影响读入。单项标记有误点名项目；单项都正确而整份标记相反，说明它与逐项
 // 结论不一致。待判定样品与待判定后直接作废、没有历史依据的样品不要求有结论，
-// 也不核对超标标记，不要求它们提前保存判定上限。key 是落盘 map 中的样品编号，
-// 用于在记录本身残缺（如空记录）时仍能指出是哪份样品。
-func validateLoadedSample(key string, smp *Sample, missingLimit map[string]bool) error {
+// 也不核对超标标记，不要求它们提前保存判定上限或生效时间。key 是落盘 map 中
+// 的样品编号，用于在记录本身残缺（如空记录）时仍能指出是哪份样品。
+func validateLoadedSample(key string, smp *Sample, missing map[string]resultMissing) error {
 	if smp == nil {
 		return fmt.Errorf("%w: 样品 %s 的记录为空", ErrCorruptRecord, key)
 	}
@@ -319,14 +363,32 @@ func validateLoadedSample(key string, smp *Sample, missingLimit map[string]bool)
 		}
 		got[r.Item] = r.Value
 	}
-	// 每条逐项判定都必须实际保存了上限数值：limit 字段缺失或为 null 时读出
-	// 的零值与明确保存的零上限无法区分，只能按字段是否存在核对。即使测量值、
-	// 超标标记与读出的零恰好互相对应，也不能把缺项当成“零等于零”的合法结论；
-	// 明确保存的零上限不在此列。不补成零、不用登记的限值填上、不重新判定。
+	// 每条逐项判定都必须实际保存了上限数值与上限生效时间：limit 或
+	// limitEffective 字段缺失或为 null 时读出的零值与明确保存的零值无法区分，
+	// 只能按字段是否存在核对。即使测量值、超标标记与读出的零恰好互相对应，
+	// 也不能把缺项当成合法结论；明确保存的零上限不在此列。不补成零、不用
+	// 登记的限值填上、不重新判定。
+	//
+	// 生效时间即使字段存在，还必须是非零真实时刻且不晚于采样时间：字段缺失、
+	// 为 null 或读出 Go 零时间都是缺少生效依据；晚于采样时间（按真实时刻、
+	// 纳秒精度，恰好相等可以接受，晚一纳秒也拒绝）说明采样当时该版上限尚未
+	// 生效，测量值与超标标记再一致也不能放行。
 	for _, r := range smp.Results {
-		if missingLimit[r.Item] {
+		m := missing[r.Item]
+		if m.limit {
 			return fmt.Errorf("%w: 样品 %s 的项目 %s 的判定缺少上限数值：limit 字段缺失或为 null",
 				ErrCorruptRecord, id, r.Item)
+		}
+		if m.effective || r.LimitEffective.IsZero() {
+			return fmt.Errorf("%w: 样品 %s 的项目 %s 的判定缺少上限生效时间：limitEffective 字段缺失、为 null 或为零时间",
+				ErrCorruptRecord, id, r.Item)
+		}
+		if r.LimitEffective.After(smp.SampledAt) {
+			return fmt.Errorf(
+				"%w: 样品 %s 的项目 %s 的上限生效时间晚于采样时间：生效时间 %s 晚于采样时间 %s（按真实时刻比较，生效时间不得晚于采样时间）",
+				ErrCorruptRecord, id, r.Item,
+				r.LimitEffective.UTC().Format(time.RFC3339Nano),
+				smp.SampledAt.UTC().Format(time.RFC3339Nano))
 		}
 	}
 	// 缺项或判定测量值与原测量不一致（按测量列表顺序报告，保持信息稳定）。

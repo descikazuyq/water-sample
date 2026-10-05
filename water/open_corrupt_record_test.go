@@ -1273,3 +1273,227 @@ func TestOpenOneWrongItemFlagAmongMany(t *testing.T) {
 	})
 	assertOpenRejects(t, dir, "S1", openTurb, false)
 }
+
+// assertOpenRejectsMissingLimit 断言判定缺少上限数值时整次 Open 失败：返回 nil
+// 存放、ErrCorruptRecord、信息点名样品编号与项目并说明缺少上限，原文件字节不变。
+func assertOpenRejectsMissingLimit(t *testing.T, dir, sampleID, item string) {
+	t.Helper()
+	before, err := os.ReadFile(filepath.Join(dir, "water-data.json"))
+	if err != nil {
+		t.Fatalf("read file before open: %v", err)
+	}
+	got, err := Open(dir)
+	if err == nil {
+		if got != nil {
+			got.Close()
+		}
+		t.Fatalf("判定缺少上限必须让整次 Open 失败，sample=%s", sampleID)
+	}
+	if got != nil {
+		t.Fatalf("打开失败时不得返回可用的数据存放对象，got %#v", got)
+	}
+	if !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("应返回 ErrCorruptRecord，got %v", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, sampleID) {
+		t.Fatalf("错误信息应指出样品编号 %q，实际 %q", sampleID, msg)
+	}
+	if !strings.Contains(msg, item) {
+		t.Fatalf("错误信息应指出项目 %q，实际 %q", item, msg)
+	}
+	if !strings.Contains(msg, "上限") {
+		t.Fatalf("错误信息应说明判定缺少上限数值，实际 %q", msg)
+	}
+	after, rerr := os.ReadFile(filepath.Join(dir, "water-data.json"))
+	if rerr != nil {
+		t.Fatalf("read file after open: %v", rerr)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("打开失败不得覆盖或改写原数据文件")
+	}
+}
+
+// writeRawDiskFile 直接写入原始 JSON 数据文件，用于构造结构体序列化无法表达的
+// 情况（如 limit 字段整个缺失或保存为 null）。
+func writeRawDiskFile(t *testing.T, dir, raw string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "water-data.json"), []byte(raw), 0o644); err != nil {
+		t.Fatalf("write data file: %v", err)
+	}
+}
+
+// 已确认样品的判定没有保存上限（limit 字段整个缺失）：即使原测量与判定测量值
+// 都是零、单项与整份标记都是达标，内容互相对应，也不能把缺了判定依据的记录
+// 当成“零等于零”的合法结论，整次打开失败并点名样品与项目。
+func TestOpenConfirmedResultLimitFieldMissing(t *testing.T) {
+	dir := t.TempDir()
+	raw := `{
+  "points": {"P1": {"id": "P1", "name": "一号取水口"}},
+  "samples": {
+    "S1": {
+      "id": "S1", "pointId": "P1",
+      "sampledAt": "` + at(10, 0).Format(time.RFC3339Nano) + `",
+      "measurements": [{"item": "pH", "value": 0}],
+      "status": "confirmed", "exceeded": false,
+      "results": [{"item": "pH", "value": 0, "limitEffective": "` +
+		openEff().Format(time.RFC3339Nano) + `", "exceeded": false}]
+    }
+  }
+}`
+	writeRawDiskFile(t, dir, raw)
+	assertOpenRejectsMissingLimit(t, dir, "S1", openPH)
+}
+
+// limit 字段保存为 JSON null 与字段缺失一样是判定依据残缺：读出的零值不能
+// 被当成真实保存的上限，整次打开失败。
+func TestOpenConfirmedResultLimitNull(t *testing.T) {
+	dir := t.TempDir()
+	raw := `{
+  "points": {"P1": {"id": "P1", "name": "一号取水口"}},
+  "samples": {
+    "S1": {
+      "id": "S1", "pointId": "P1",
+      "sampledAt": "` + at(10, 0).Format(time.RFC3339Nano) + `",
+      "measurements": [{"item": "pH", "value": 0}],
+      "status": "confirmed", "exceeded": false,
+      "results": [{"item": "pH", "value": 0, "limit": null, "limitEffective": "` +
+		openEff().Format(time.RFC3339Nano) + `", "exceeded": false}]
+    }
+  }
+}`
+	writeRawDiskFile(t, dir, raw)
+	assertOpenRejectsMissingLimit(t, dir, "S1", openPH)
+}
+
+// 多项目样品只有一项缺少上限：不能只接收其他项目或保留整份结论，整次打开失败。
+func TestOpenConfirmedOneResultLimitMissingAmongMany(t *testing.T) {
+	dir := t.TempDir()
+	raw := `{
+  "points": {"P1": {"id": "P1", "name": "一号取水口"}},
+  "samples": {
+    "S1": {
+      "id": "S1", "pointId": "P1",
+      "sampledAt": "` + at(10, 0).Format(time.RFC3339Nano) + `",
+      "measurements": [{"item": "pH", "value": 7}, {"item": "浊度", "value": 4}],
+      "status": "confirmed", "exceeded": false,
+      "results": [
+        {"item": "pH", "value": 7, "limit": 8, "limitEffective": "` +
+		openEff().Format(time.RFC3339Nano) + `", "exceeded": false},
+        {"item": "浊度", "value": 4, "limitEffective": "` +
+		openEff().Format(time.RFC3339Nano) + `", "exceeded": false}
+      ]
+    }
+  }
+}`
+	writeRawDiskFile(t, dir, raw)
+	assertOpenRejectsMissingLimit(t, dir, "S1", openTurb)
+}
+
+// 已确认后作废、逐项判定仍保留的样品，判定缺少上限同样不能借“历史记录”名义
+// 混进台账：整次打开失败。
+func TestOpenVoidedAfterConfirmedResultLimitMissing(t *testing.T) {
+	dir := t.TempDir()
+	raw := `{
+  "points": {"P1": {"id": "P1", "name": "一号取水口"}},
+  "samples": {
+    "S1": {
+      "id": "S1", "pointId": "P1",
+      "sampledAt": "` + at(10, 0).Format(time.RFC3339Nano) + `",
+      "measurements": [{"item": "pH", "value": 9}],
+      "status": "voided", "voidReason": "复测确认样品污染", "exceeded": true,
+      "results": [{"item": "pH", "value": 9, "limitEffective": "` +
+		openEff().Format(time.RFC3339Nano) + `", "exceeded": true}]
+    }
+  }
+}`
+	writeRawDiskFile(t, dir, raw)
+	assertOpenRejectsMissingLimit(t, dir, "S1", openPH)
+}
+
+// 明确保存数值零的上限是合法依据：测量值为零、上限为零、单项与整份都达标，
+// 必须正常读入且上限原样保留为零，不能把零当成缺项。
+func TestOpenConfirmedExplicitZeroLimitIsValid(t *testing.T) {
+	dir := t.TempDir()
+	raw := `{
+  "points": {"P1": {"id": "P1", "name": "一号取水口"}},
+  "samples": {
+    "S1": {
+      "id": "S1", "pointId": "P1",
+      "sampledAt": "` + at(10, 0).Format(time.RFC3339Nano) + `",
+      "measurements": [{"item": "pH", "value": 0}],
+      "status": "confirmed", "exceeded": false,
+      "results": [{"item": "pH", "value": 0, "limit": 0, "limitEffective": "` +
+		openEff().Format(time.RFC3339Nano) + `", "exceeded": false}]
+    }
+  }
+}`
+	writeRawDiskFile(t, dir, raw)
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("明确保存的零上限是合法依据，应正常读入: %v", err)
+	}
+	defer s.Close()
+	latest, ok, err := s.LatestResult("P1")
+	if err != nil || !ok {
+		t.Fatalf("零上限的完整记录应可作为最近有效结果: %+v ok=%v err=%v", latest, ok, err)
+	}
+	r := latest.Results[0]
+	if r.Value != 0 || r.Limit != 0 || r.Exceeded || latest.Exceeded {
+		t.Fatalf("零上限与达标结论必须原样保留: %+v exceeded=%v", r, latest.Exceeded)
+	}
+}
+
+// 同一文件中其他样品完整正常，也不能跳过缺上限的记录继续打开：整次失败、
+// 无可用存放，正常样品同样读不到。
+func TestOpenMissingLimitRejectsWholeFile(t *testing.T) {
+	dir := t.TempDir()
+	raw := `{
+  "points": {"P1": {"id": "P1", "name": "一号取水口"}},
+  "samples": {
+    "S-GOOD": {
+      "id": "S-GOOD", "pointId": "P1",
+      "sampledAt": "` + at(5, 0).Format(time.RFC3339Nano) + `",
+      "measurements": [{"item": "pH", "value": 7}],
+      "status": "confirmed", "exceeded": false,
+      "results": [{"item": "pH", "value": 7, "limit": 8, "limitEffective": "` +
+		openEff().Format(time.RFC3339Nano) + `", "exceeded": false}]
+    },
+    "S-BAD": {
+      "id": "S-BAD", "pointId": "P1",
+      "sampledAt": "` + at(10, 0).Format(time.RFC3339Nano) + `",
+      "measurements": [{"item": "pH", "value": 0}],
+      "status": "confirmed", "exceeded": false,
+      "results": [{"item": "pH", "value": 0, "limitEffective": "` +
+		openEff().Format(time.RFC3339Nano) + `", "exceeded": false}]
+    }
+  }
+}`
+	writeRawDiskFile(t, dir, raw)
+	assertOpenRejectsMissingLimit(t, dir, "S-BAD", openPH)
+}
+
+// 即使文件里登记了采样当时适用的限值，也不能据此补造已保存结论缺少的依据：
+// 缺上限的判定照样整次拒绝，不从登记的限值里找一版填上。
+func TestOpenMissingLimitNotBackfilledFromRegisteredLimits(t *testing.T) {
+	dir := t.TempDir()
+	raw := `{
+  "points": {"P1": {"id": "P1", "name": "一号取水口"}},
+  "limits": {"4:P1:2pH": [
+    {"pointId": "P1", "item": "pH", "value": 8, "effective": "` +
+		openEff().Format(time.RFC3339Nano) + `"}
+  ]},
+  "samples": {
+    "S1": {
+      "id": "S1", "pointId": "P1",
+      "sampledAt": "` + at(10, 0).Format(time.RFC3339Nano) + `",
+      "measurements": [{"item": "pH", "value": 9}],
+      "status": "confirmed", "exceeded": true,
+      "results": [{"item": "pH", "value": 9, "limitEffective": "` +
+		openEff().Format(time.RFC3339Nano) + `", "exceeded": true}]
+    }
+  }
+}`
+	writeRawDiskFile(t, dir, raw)
+	assertOpenRejectsMissingLimit(t, dir, "S1", openPH)
+}

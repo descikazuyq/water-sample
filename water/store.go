@@ -44,7 +44,7 @@ var (
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
 	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
-	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少原测量、测量项目重复、测量项目与逐项判定对应不上或超标标记与保存的判定依据不一致的损坏样品记录")
+	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少原测量、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值或超标标记与保存的判定依据不一致的损坏样品记录")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -74,6 +74,37 @@ type ItemResult struct {
 	Limit          float64   `json:"limit"`
 	LimitEffective time.Time `json:"limitEffective"`
 	Exceeded       bool      `json:"exceeded"`
+	// limitSaved 记录从本地数据读入时 limit 字段是否真实保存了数值：
+	// 字段缺失或保存为 null 时 Limit 只是反序列化出的零值，不能当成判定依据。
+	// 该字段不参与落盘，正常确认流程保存的记录始终写出 limit 数值。
+	limitSaved bool
+}
+
+// UnmarshalJSON 读入逐项判定时区分“明确保存了零上限”与“没有保存上限”：
+// 两者经默认反序列化都会得到 Limit 为零，但后者是判定依据残缺，必须在打开时
+// 识别出来。落盘格式不变：正常记录始终写出 limit 数值，显式的零照常保存。
+func (r *ItemResult) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Item           string    `json:"item"`
+		Value          float64   `json:"value"`
+		Limit          *float64  `json:"limit"`
+		LimitEffective time.Time `json:"limitEffective"`
+		Exceeded       bool      `json:"exceeded"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	r.Item = raw.Item
+	r.Value = raw.Value
+	r.LimitEffective = raw.LimitEffective
+	r.Exceeded = raw.Exceeded
+	r.Limit = 0
+	r.limitSaved = false
+	if raw.Limit != nil {
+		r.Limit = *raw.Limit
+		r.limitSaved = true
+	}
+	return nil
 }
 
 // Sample 是一份从录入、确认到作废的样品记录。
@@ -127,7 +158,10 @@ type Store struct {
 // 必须按项目名完整一一对应；判定里同一项目不能出现两次；每个测量项目必须且
 // 只能有一条判定，判定里也不能出现原测量没有的项目；对应项目的判定测量值必须
 // 与原测量值一致（零是合法测量值，不会被当成缺项）。两个列表排列顺序不同不
-// 影响对应，成功读入后测量与判定各自保留原顺序。最后核对超标标记与该样品
+// 影响对应，成功读入后测量与判定各自保留原顺序。每条逐项判定还必须实际保存了
+// 上限数值：limit 字段缺失或保存为 null 都表示判定依据残缺，即使读出的零值
+// 恰好与测量值、超标标记互相吻合，也不能当成“零等于零”的合法结论；明确保存的
+// 零上限仍是合法依据，负数和正数上限保持原有行为。最后核对超标标记与该样品
 // 已保存的判定依据一致：每条判定的超标标记必须严格符合该条保存的测量值与
 // 上限——测量值严格大于上限才是超标，小于或等于（包括等于、零与负数的合法
 // 组合）都应为达标；整份样品的超标标记必须与逐项结论一致，任一项超标就应为
@@ -226,7 +260,13 @@ func Open(dir string) (*Store, error) {
 // 中是否存在该项目判断，不把零当成缺项）。项目按名称对应，与两个列表的排列
 // 顺序无关。
 //
-// 对应关系通过后，超标标记还必须与这份样品已保存的判定依据一致：每条判定的
+// 对应关系通过后，每条逐项判定还必须实际保存了上限数值：limit 字段在文件中
+// 缺失或保存为 null 时，读出的 Limit 只是零值，属于判定依据残缺——即使测量值
+// 也是零、单项与整份超标标记恰好与“和零比较”的结果吻合，也不能据此放行；不能
+// 补成零、不能从登记的限值中找一版填上、不能重新判定。明确保存数值零的上限仍是
+// 合法依据，负数和正数上限保持原有行为，不把零当成缺项。
+//
+// 上限完整后，超标标记还必须与这份样品已保存的判定依据一致：每条判定的
 // Exceeded 必须严格等于“该条保存的测量值 > 该条保存的上限”，测量值小于或等于
 // 上限（含等于、零或负数的合法数值组合）都应为达标；整份样品的 Exceeded 必须
 // 等于“是否有任一项超标”，全部达标则应为假。这里只核对已保存的依据本身，
@@ -289,12 +329,20 @@ func validateLoadedSample(key string, smp *Sample) error {
 				ErrCorruptRecord, id, r.Item)
 		}
 	}
+	// 每条逐项判定都必须实际保存了上限数值：limit 字段缺失或保存为 null 时，
+	// 读出的 Limit 只是零值，即使测量值与超标标记恰好与“和零比较”的结果吻合，
+	// 也不能把这份缺了判定依据的记录当成“零等于零”的合法结论。不能补成零、
+	// 不能从登记的限值里找一版填上、不能重新判定；明确保存的零上限仍是合法依据。
 	// 超标标记必须与这份样品已保存的判定依据一致。只按每条记录保存的测量值与
 	// 上限判断：严格大于才超标，小于或等于（含等于、零或负数的合法组合）都为
 	// 达标；不重新选择当前限值。单项标记与依据矛盾时点名该项目，整份标记与
 	// 逐项结论矛盾时单独说明。整份样品只允许一种矛盾先报出，但两者都会拒绝。
 	anyExceeded := false
 	for _, r := range smp.Results {
+		if !r.limitSaved {
+			return fmt.Errorf("%w: 样品 %s 的项目 %s 判定缺少上限数值：本地数据中该条判定的 limit 字段缺失或为 null，不能按零处理",
+				ErrCorruptRecord, id, r.Item)
+		}
 		want := r.Value > r.Limit
 		if r.Exceeded != want {
 			return fmt.Errorf("%w: 样品 %s 的项目 %s 超标标记与保存的判定依据不一致：测量值 %g %s 上限 %g 应判为%s，却保存为%s",
@@ -752,5 +800,10 @@ func copySample(s *Sample) Sample {
 	c := *s
 	c.Measurements = append([]Measurement(nil), s.Measurements...)
 	c.Results = append([]ItemResult(nil), s.Results...)
+	// limitSaved 只是打开本地数据时的校验痕迹，不属于记录内容本身：
+	// 返回给调用方的副本一律抹去，保证逐项判定只含实际保存的字段。
+	for i := range c.Results {
+		c.Results[i].limitSaved = false
+	}
 	return c
 }

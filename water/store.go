@@ -245,12 +245,23 @@ func (s *Store) RegisterPoint(id, name string) (SamplingPoint, error) {
 }
 
 // SetLimit 为已登记采样点的某个测量项目登记一版数值上限及生效时间。
+// 采样点编号和项目名必须是合法的 UTF-8 文本：任一字段含孤立的 0xFF、0xFE
+// 字节或不完整的多字节序列等无法原样保存的内容时，整次登记以 ErrInvalidText
+// 拒绝，不新增版本、不占用生效时间、不改变已有上限；真正的 U+FFFD（“�”）、
+// 中文和文本内部的 U+0000 仍是合法字符。即使同一请求还存在采样点未登记、
+// 数值不是有限数或生效时间缺失等问题，也报告编码错误。
 // 允许乱序补录；生效时间相同（不同时区表示的同一时刻也算相同）的第二条拒绝。
 func (s *Store) SetLimit(pointID, item string, value float64, effective time.Time) (Limit, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkOpenLocked(); err != nil {
 		return Limit{}, err
+	}
+	// 在去首尾空白和其它任何处理之前检查原始文本：落盘 JSON 会把非法 UTF-8
+	// 静默替换成 U+FFFD，限值会因此挂到另一个项目名下，返回记录与保存内容
+	// 也对不上；只有整次拒绝才能保证限值始终属于实际填写的采样点和项目。
+	if invalidUTF8(pointID) || invalidUTF8(item) {
+		return Limit{}, ErrInvalidText
 	}
 	pointID, item = clean(pointID), clean(item)
 	if pointID == "" || item == "" {

@@ -2,6 +2,7 @@ package water
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"math"
 	"os"
@@ -43,6 +44,27 @@ func assertNoReplacementBytes(t *testing.T, dir, label string) {
 	}
 	if bytes.Contains(data, []byte{0xEF, 0xBF, 0xBD}) {
 		t.Fatalf("%s: 被拒绝的非法文本被替换成 U+FFFD 落盘", label)
+	}
+}
+
+// assertNoLimitValue 确认落盘数据中不存在任何数值为 v 的限值版本，
+// 用于验证被拒绝的登记没有留下任何版本（含被静默改写到其它项目名下的）。
+func assertNoLimitValue(t *testing.T, dir string, v float64, label string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "water-data.json"))
+	if err != nil {
+		t.Fatalf("%s: 读取落盘文件: %v", label, err)
+	}
+	var st diskState
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatalf("%s: 解析落盘文件: %v", label, err)
+	}
+	for _, versions := range st.Limits {
+		for _, lim := range versions {
+			if lim.Value == v {
+				t.Fatalf("%s: 被拒绝的限值出现在落盘数据中: %+v", label, lim)
+			}
+		}
 	}
 }
 
@@ -194,6 +216,173 @@ func mustConfirm(t *testing.T, s *Store, id string) Sample {
 		t.Fatalf("Confirm(%q): %v", id, err)
 	}
 	return smp
+}
+
+// SetLimit 的采样点编号或项目名含非法 UTF-8 字节时整次拒绝：返回空限值记录和
+// ErrInvalidText，不新增版本、不占用生效时间、不改变已有上限；即使同次请求还有
+// 采样点未登记、数值非有限数或生效时间缺失等问题，也报告编码错误。已关闭的
+// 数据存放仍按原规则报 ErrClosed。
+func TestSetLimitRejectsInvalidUTF8(t *testing.T) {
+	s, dir := open(t)
+	mustPoint(t, s, "P1", "取水口")
+	mustLimit(t, s, "P1", "浊�度", 10.0, at(1, 0))
+
+	bad := []string{
+		"浊" + "\xff" + "度", // 合法中文之间夹孤立 0xFF
+		"P1" + "\xfe",      // 孤立 0xFE
+		"\xe4\xb8",         // 截断的多字节字符
+		"浊度" + "\xc0\xaf",  // 非法多字节序列
+	}
+
+	setLimit := func(label, point, item string, v float64, eff time.Time) {
+		t.Helper()
+		got, err := s.SetLimit(point, item, v, eff)
+		if !errors.Is(err, ErrInvalidText) {
+			t.Fatalf("%s: 应返回 ErrInvalidText，实际为 %v", label, err)
+		}
+		for _, target := range []error{ErrEmptyField, ErrUnknownPoint, ErrInvalidValue, ErrInvalidTime, ErrDuplicateLimitTime} {
+			if errors.Is(err, target) {
+				t.Fatalf("%s: 编码问题不能被归为 %v: %v", label, target, err)
+			}
+		}
+		if got != (Limit{}) {
+			t.Fatalf("%s: 失败必须返回空限值记录，实际为 %+v", label, got)
+		}
+	}
+
+	// 项目名非法
+	setLimit("项目名夹孤立 0xFF", "P1", bad[0], 5.0, at(2, 0))
+	setLimit("项目名为截断序列", "P1", bad[2], 5.0, at(2, 0))
+	setLimit("项目名含非法序列", "P1", bad[3], 5.0, at(2, 0))
+	// 采样点编号非法
+	setLimit("采样点含孤立 0xFE", bad[1], "浊�度", 5.0, at(2, 0))
+	// 编码问题优先于其它一切校验：未登记采样点、非有限数值、缺失生效时间
+	setLimit("非法采样点且未登记", "P9"+"\xff", "浊度", 5.0, at(2, 0))
+	setLimit("非法项目+非有限数值", "P1", bad[0], math.Inf(1), at(2, 0))
+	setLimit("非法项目+零生效时间", "P1", bad[0], 5.0, time.Time{})
+	setLimit("非法项目+全部问题", "P9"+"\xfe", bad[2], math.NaN(), time.Time{})
+
+	// 全部拒绝之后：没有新增版本，生效时间 at(2, 0) 未被占用，已有上限保持原样。
+	// 先关闭重新打开，再按任务场景验证：为“浊�度”录入并确认采样时间晚于两次
+	// 生效时间、测量值为 7 的样品，仍按已成功登记的上限 10 判为达标；
+	// 若失败的上限 5 被保存则会误判超标。
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// 落盘数据中没有失败请求的痕迹：不存在任何数值为 5 的限值版本。
+	// 注意本测试合法地保存了含真正 U+FFFD 的项目名“浊�度”，不能再用
+	// “文件中无 U+FFFD 字节”作为判据。
+	assertNoLimitValue(t, dir, 5.0, "SetLimit 全部拒绝后")
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	mustSample(t, s2, "S-check", "P1", at(10, 0), Measurement{Item: "浊�度", Value: 7})
+	confirmed := mustConfirm(t, s2, "S-check")
+	if confirmed.Exceeded || len(confirmed.Results) != 1 {
+		t.Fatalf("测量值 7 应按上限 10 判为达标: %+v", confirmed)
+	}
+	if r := confirmed.Results[0]; r.Item != "浊�度" || r.Limit != 10.0 || !r.LimitEffective.Equal(at(1, 0)) || r.Exceeded {
+		t.Fatalf("判定依据应为 at(1,0) 生效的上限 10: %+v", r)
+	}
+
+	// 失败请求占用的生效时间仍可正常补录
+	lim, err := s2.SetLimit("P1", "浊�度", 12.0, at(2, 0))
+	if err != nil {
+		t.Fatalf("失败请求不得占用生效时间: %v", err)
+	}
+	if lim.Item != "浊�度" || lim.Value != 12.0 {
+		t.Fatalf("补录的限值记录异常: %+v", lim)
+	}
+	// 已确认样品的判定依据不受补录影响
+	again := mustConfirm(t, s2, "S-check")
+	if again.Results[0].Limit != 10.0 || again.Exceeded {
+		t.Fatalf("已确认样品的判定依据不应改变: %+v", again)
+	}
+
+	// 原本没有适用上限的项目，失败请求不能让它获得判定依据
+	if _, err := s2.SetLimit("P1", "pH"+"\xff", 8.0, at(1, 0)); !errors.Is(err, ErrInvalidText) {
+		t.Fatalf("无上限项目的非法登记应报编码错误，got %v", err)
+	}
+	mustSample(t, s2, "S-nolimit", "P1", at(10, 0), Measurement{Item: "pH", Value: 7})
+	if _, err := s2.Confirm("S-nolimit"); !errors.Is(err, ErrMissingLimit) {
+		t.Fatalf("失败请求不得提供判定依据，got %v", err)
+	}
+
+	// 已关闭的数据存放仍按原规则拒绝，即使文本非法
+	if err := s2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := s2.SetLimit("P1", bad[0], 5.0, at(3, 0)); !errors.Is(err, ErrClosed) {
+		t.Fatalf("已关闭应报 ErrClosed，got %v", err)
+	}
+}
+
+// SetLimit 照常接受真正的 U+FFFD（“�”）、中文和文本内部的 U+0000；只去首尾
+// 空白，不替换字符、不转换大小写、不合并不同名称，返回记录与后续判定保存的
+// 项目名一致。
+func TestSetLimitAcceptsValidUnicodeText(t *testing.T) {
+	s, dir := open(t)
+	mustPoint(t, s, "P1", "取水口")
+
+	items := []string{"浊�度", "浊度", "ph\x00x", "pH", "PH"}
+	for i, item := range items {
+		lim, err := s.SetLimit("P1", "  "+item+"  ", float64(10+i), at(1, i))
+		if err != nil {
+			t.Fatalf("合法项目名 %q 不应被拒绝: %v", item, err)
+		}
+		if lim.Item != item || lim.PointID != "P1" {
+			t.Fatalf("返回的限值只应去首尾空白: %+v", lim)
+		}
+	}
+
+	// 采样时间晚于全部生效时间，逐项按各自上限判定，项目名原样保存
+	ms := make([]Measurement, len(items))
+	for i, item := range items {
+		ms[i] = Measurement{Item: item, Value: 1}
+	}
+	mustSample(t, s, "S-unicode", "P1", at(10, 0), ms...)
+	confirmed := mustConfirm(t, s, "S-unicode")
+	rs := map[string]ItemResult{}
+	for _, r := range confirmed.Results {
+		rs[r.Item] = r
+	}
+	for i, item := range items {
+		r, ok := rs[item]
+		if !ok {
+			t.Fatalf("判定结果中项目名 %q 被改写或缺失: %+v", item, confirmed.Results)
+		}
+		if want := float64(10 + i); r.Limit != want {
+			t.Fatalf("项目 %q 适用上限应为 %v，实际为 %+v", item, want, r)
+		}
+	}
+
+	// 重开后各组限值仍按各自项目名归位
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	mustSample(t, s2, "S-unicode-2", "P1", at(11, 0), ms...)
+	confirmed2 := mustConfirm(t, s2, "S-unicode-2")
+	for _, r := range confirmed2.Results {
+		found := false
+		for i, item := range items {
+			if r.Item == item {
+				found = true
+				if want := float64(10 + i); r.Limit != want {
+					t.Fatalf("重开后项目 %q 适用上限应为 %v，实际为 %+v", item, want, r)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("重开后判定结果出现未知项目名 %q", r.Item)
+		}
+	}
 }
 
 // “�”（U+FFFD）本身是合法字符，中文、其它有效多字节字符和内部 U+0000

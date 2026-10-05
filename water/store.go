@@ -44,7 +44,7 @@ var (
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
 	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
-	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少原测量、测量项目重复、测量项目与逐项判定对应不上或超标标记与保存的判定依据不一致的损坏样品记录")
+	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少原测量、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值或超标标记与保存的判定依据不一致的损坏样品记录")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -126,19 +126,24 @@ type Store struct {
 // 已确认后作废、逐项依据仍保留在 Results 中的样品，其原测量项目与逐项判定
 // 必须按项目名完整一一对应；判定里同一项目不能出现两次；每个测量项目必须且
 // 只能有一条判定，判定里也不能出现原测量没有的项目；对应项目的判定测量值必须
-// 与原测量值一致（零是合法测量值，不会被当成缺项）。两个列表排列顺序不同不
-// 影响对应，成功读入后测量与判定各自保留原顺序。最后核对超标标记与该样品
-// 已保存的判定依据一致：每条判定的超标标记必须严格符合该条保存的测量值与
-// 上限——测量值严格大于上限才是超标，小于或等于（包括等于、零与负数的合法
-// 组合）都应为达标；整份样品的超标标记必须与逐项结论一致，任一项超标就应为
-// 真、全部达标就应为假。只核对本文件里已保存的依据，不重新选择当前限值、
-// 不重做判定。任一份样品对不上，整次打开以可被 errors.Is(err, ErrCorruptRecord)
-// 识别的错误失败，返回 nil 数据存放，错误信息点到具体样品编号与缺少原测量的
-// 原因（或具体项目）；单项超标标记有误时点到具体项目，整份标记有误时说明它
-// 与逐项结论不一致；不会静默跳过问题样品、不会择一保留或合并重复测量、不会
-// 补出缺失测量或判定、不会修正超标标记或重新判定、不会把它改成另一种状态、
-// 也不会把拒绝推迟到请求确认时，更不会改写原文件。待判定样品没有判定记录、
-// 待判定后作废的样品没有历史依据，均属正常，只要原测量完整就照常读入。
+// 与原测量值一致（零是合法测量值，不会被当成缺项）。每条逐项判定还必须实际
+// 保存了上限数值：limit 字段缺失或保存为 null 都是判定依据残缺，即使读出
+// 的零值与测量值、超标标记恰好对得上，也不能当成“零等于零”的合法结论；
+// 明确保存数值零的上限仍是合法依据，负数和正数上限也保持原有行为。两个列表
+// 排列顺序不同不影响对应，成功读入后测量与判定各自保留原顺序。最后核对超标
+// 标记与该样品已保存的判定依据一致：每条判定的超标标记必须严格符合该条保存
+// 的测量值与上限——测量值严格大于上限才是超标，小于或等于（包括等于、零与
+// 负数的合法组合）都应为达标；整份样品的超标标记必须与逐项结论一致，任一
+// 项超标就应为真、全部达标就应为假。只核对本文件里已保存的依据，不重新选择
+// 当前限值、不重做判定。任一份样品对不上，整次打开以可被
+// errors.Is(err, ErrCorruptRecord) 识别的错误失败，返回 nil 数据存放，
+// 错误信息点到具体样品编号与缺少原测量的原因（或具体项目）；判定缺少上限
+// 数值时点到具体项目；单项超标标记有误时点到具体项目，整份标记有误时说明
+// 它与逐项结论不一致；不会静默跳过问题样品、不会择一保留或合并重复测量、
+// 不会补出缺失测量、判定或上限数值、不会修正超标标记或重新判定、不会把它
+// 改成另一种状态、也不会把拒绝推迟到请求确认时，更不会改写原文件。待判定
+// 样品没有判定记录、待判定后作废的样品没有历史依据，均属正常，只要原测量
+// 完整就照常读入，不要求它们提前保存判定上限。
 // 完整记录原样读入，已保存的上限、生效时间、逐项结论与整份超标标记保留，不因
 // 后来新增或补录的限值而拒绝或重新计算。没有任何样品的新数据目录，以及样品
 // 集合为空的已有数据，都照常打开。
@@ -188,21 +193,57 @@ func Open(dir string) (*Store, error) {
 	if st.Samples != nil {
 		// 逐份校验后才整体接收：任何状态的样品都必须至少保留一个原测量，
 		// 原测量项目名重复也都是损坏，带结论的样品还要求逐项判定与原测量
-		// 完整对应。任一份样品不通过，整次打开都失败，不返回数据存放对象，
-		// 也不静默跳过、择一保留、补测量、补判定或回写原文件。
+		// 完整对应、每条判定都实际保存了上限数值。任一份样品不通过，整次
+		// 打开都失败，不返回数据存放对象，也不静默跳过、择一保留、补测量、
+		// 补判定、补上限或回写原文件。
+		missingLimit, err := missingResultLimits(data)
+		if err != nil {
+			return nil, fmt.Errorf("water: 读取数据文件失败: %w", err)
+		}
 		ids := make([]string, 0, len(st.Samples))
 		for id := range st.Samples {
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
 		for _, id := range ids {
-			if err := validateLoadedSample(id, st.Samples[id]); err != nil {
+			if err := validateLoadedSample(id, st.Samples[id], missingLimit[id]); err != nil {
 				return nil, err
 			}
 		}
 		s.samples = st.Samples
 	}
 	return s, nil
+}
+
+// missingResultLimits 重新扫描数据文件，找出每份样品的逐项判定中 limit 字段
+// 缺失或保存为 null 的测量项目。JSON 反序列化把字段缺失与 null 都落成 float64
+// 零值，与明确保存的零上限无法区分，因此“有没有保存上限”只能在读取时按字段
+// 是否存在单独核对；明确写出数值零（以及负数、正数）的上限不在此列。
+// 返回的 map 以落盘样品编号为键，键内是缺少上限数值的项目名集合。
+func missingResultLimits(data []byte) (map[string]map[string]bool, error) {
+	var probe struct {
+		Samples map[string]struct {
+			Results []struct {
+				Item  string   `json:"item"`
+				Limit *float64 `json:"limit"`
+			} `json:"results"`
+		} `json:"samples"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return nil, err
+	}
+	missing := map[string]map[string]bool{}
+	for key, smp := range probe.Samples {
+		for _, r := range smp.Results {
+			if r.Limit == nil {
+				if missing[key] == nil {
+					missing[key] = map[string]bool{}
+				}
+				missing[key][r.Item] = true
+			}
+		}
+	}
+	return missing, nil
 }
 
 // validateLoadedSample 校验一份从本地文件读入的样品记录。
@@ -226,16 +267,23 @@ func Open(dir string) (*Store, error) {
 // 中是否存在该项目判断，不把零当成缺项）。项目按名称对应，与两个列表的排列
 // 顺序无关。
 //
-// 对应关系通过后，超标标记还必须与这份样品已保存的判定依据一致：每条判定的
+// 每条逐项判定还必须实际保存了上限数值：本地数据中该条判定的 limit 字段缺失，
+// 或字段值为 null，都视为判定依据残缺（missingLimit 由 missingResultLimits 按
+// 字段是否存在探出）。即使读出的零值与测量值、超标标记恰好互相对应，也不能把
+// 它当成“零等于零”的合法结论；明确保存数值零的上限仍是合法依据，负数和正数
+// 上限也保持原有行为，不把零当成缺项。不补成零、不从登记的限值中找值填上、
+// 不重新判定。多项目样品只有一项缺少上限，同样整份拒绝。
+//
+// 对应关系与上限数值都通过后，超标标记还必须与这份样品已保存的判定依据一致：每条判定的
 // Exceeded 必须严格等于“该条保存的测量值 > 该条保存的上限”，测量值小于或等于
 // 上限（含等于、零或负数的合法数值组合）都应为达标；整份样品的 Exceeded 必须
 // 等于“是否有任一项超标”，全部达标则应为假。这里只核对已保存的依据本身，
 // 不按当前限值重新选择上限、不重做判定，因此后来补录的限值即使会使结论改变，
 // 也不影响读入。单项标记有误点名项目；单项都正确而整份标记相反，说明它与逐项
 // 结论不一致。待判定样品与待判定后直接作废、没有历史依据的样品不要求有结论，
-// 也不核对超标标记。key 是落盘 map 中的样品编号，用于在记录本身残缺（如空记录）
-// 时仍能指出是哪份样品。
-func validateLoadedSample(key string, smp *Sample) error {
+// 也不核对超标标记，不要求它们提前保存判定上限。key 是落盘 map 中的样品编号，
+// 用于在记录本身残缺（如空记录）时仍能指出是哪份样品。
+func validateLoadedSample(key string, smp *Sample, missingLimit map[string]bool) error {
 	if smp == nil {
 		return fmt.Errorf("%w: 样品 %s 的记录为空", ErrCorruptRecord, key)
 	}
@@ -270,6 +318,16 @@ func validateLoadedSample(key string, smp *Sample) error {
 			return fmt.Errorf("%w: 样品 %s 的项目 %s 判定记录重复", ErrCorruptRecord, id, r.Item)
 		}
 		got[r.Item] = r.Value
+	}
+	// 每条逐项判定都必须实际保存了上限数值：limit 字段缺失或为 null 时读出
+	// 的零值与明确保存的零上限无法区分，只能按字段是否存在核对。即使测量值、
+	// 超标标记与读出的零恰好互相对应，也不能把缺项当成“零等于零”的合法结论；
+	// 明确保存的零上限不在此列。不补成零、不用登记的限值填上、不重新判定。
+	for _, r := range smp.Results {
+		if missingLimit[r.Item] {
+			return fmt.Errorf("%w: 样品 %s 的项目 %s 的判定缺少上限数值：limit 字段缺失或为 null",
+				ErrCorruptRecord, id, r.Item)
+		}
 	}
 	// 缺项或判定测量值与原测量不一致（按测量列表顺序报告，保持信息稳定）。
 	for _, m := range smp.Measurements {

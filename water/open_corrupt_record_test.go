@@ -11,15 +11,18 @@ import (
 )
 
 // 本文件保护“打开本地数据”时的记录完整性校验：
-// 每份样品的原测量中同一个项目名只能出现一次，这条规则对任何状态的样品都生效，
-// 包括没有逐项判定的待判定样品，以及待判定后直接作废、没有历史判定依据的样品；
-// 重复按保存的完整项目名判断，不靠相邻、不因同值（含两个零）放行。
-// 带结论的样品还要求原测量项目与逐项判定按项目名完整一一对应、且对应项目的
-// 测量值一致；缺项、多项、判定项目重复、测量值对不上（零也是合法测量值）或
-// 整份样品没有测量项目，都必须让整次 Open 失败，返回 nil 存放，错误信息点到
-// 具体样品编号与项目，且不覆盖原文件、不静默跳过、不择一保留或合并重复测量、
-// 不补判定、不改成待判定。待判定样品、待判定后作废（无历史依据）的样品在原测量
-// 不重复时不受影响；已确认后作废但历史依据完整的样品继续兼容。
+// 每份样品无论状态都必须至少保留一个原测量项目——列表为空、保存为 null 或整个
+// 字段缺失都是内容残缺，待判定、已确认、已作废（含待判定后直接作废）一律拒绝，
+// 也不能用残留的逐项判定反填原测量；原测量中同一个项目名只能出现一次，这条规则
+// 对任何状态的样品都生效，包括没有逐项判定的待判定样品，以及待判定后直接作废、
+// 没有历史判定依据的样品；重复按保存的完整项目名判断，不靠相邻、不因同值
+// （含两个零）放行。带结论的样品还要求原测量项目与逐项判定按项目名完整一一对应、
+// 且对应项目的测量值一致；缺项、多项、判定项目重复、测量值对不上（零也是合法
+// 测量值），都必须让整次 Open 失败，返回 nil 存放，错误信息点到具体样品编号与
+// 项目，且不覆盖原文件、不静默跳过、不择一保留或合并重复测量、不补测量或判定、
+// 不改成待判定。待判定样品、待判定后作废（无历史依据）的样品在原测量齐全且
+// 不重复时不受影响；已确认后作废但历史依据完整的样品继续兼容；没有任何样品的
+// 新目录与样品集合为空的已有数据照常打开。
 
 const (
 	openPH   = "pH"
@@ -675,4 +678,151 @@ func TestOpenPendingDuplicateRejectsWholeFile(t *testing.T) {
 		},
 	})
 	assertOpenRejects(t, dir, "S-BAD", openPH, false)
+}
+
+// 待判定样品一个原测量项目都没有（字段缺失，落盘为 null）是内容残缺：
+// 即使编号、采样点、采样时间齐全，整次打开也必须失败并点名样品，
+// 不能让它在确认时拿到没有逐项依据的结论。
+func TestOpenPendingNoMeasurements(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Status: StatusPending,
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", "", true)
+}
+
+// 原测量保存为空列表（[]）与字段缺失一样残缺：待判定样品同样整次拒绝。
+func TestOpenPendingEmptyMeasurementsList(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{},
+				Status:       StatusPending,
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", "", true)
+}
+
+// 待判定后直接作废的样品也至少要保留一个原测量项目：它不再参与有效判定，
+// 但内容丢失不能因此被放过。
+func TestOpenVoidedFromPendingNoMeasurements(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Status: StatusVoided, VoidReason: "录入信息有误",
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", "", true)
+}
+
+// 原测量为空但仍残留逐项判定：不能用判定内容反填原测量，整次打开失败。
+func TestOpenNoMeasurementsWithResidualResults(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Status: StatusVoided, VoidReason: "复测确认样品污染", Exceeded: true,
+				Results: []ItemResult{
+					{Item: openPH, Value: 9, Limit: 8, LimitEffective: openEff(), Exceeded: true},
+				},
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", "", true)
+}
+
+// 没有任何原测量的待判定样品与其他完整样品同处一个文件：不能只跳过它继续
+// 打开，整次失败、无可用存放，完整样品也读不到。
+func TestOpenPendingNoMeasurementsRejectsWholeFile(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			// 完整、正常的已确认样品。
+			"S-GOOD": {
+				ID: "S-GOOD", PointID: "P1", SampledAt: at(5, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 7}},
+				Status:       StatusConfirmed, Exceeded: false,
+				Results: []ItemResult{
+					{Item: openPH, Value: 7, Limit: 8, LimitEffective: openEff(), Exceeded: false},
+				},
+			},
+			// 待判定且原测量整体丢失的损坏样品。
+			"S-BAD": {
+				ID: "S-BAD", PointID: "P1", SampledAt: at(10, 0),
+				Status: StatusPending,
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S-BAD", "", true)
+}
+
+// 只含一个项目且测量值为零的样品并不为空：正常读入，零值与原状态保留。
+func TestOpenPendingSingleZeroMeasurement(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 0}},
+				Status:       StatusPending,
+			},
+		},
+	})
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("单个零值测量不是空样品，应正常读入: %v", err)
+	}
+	defer s.Close()
+	list, err := s.ListByPoint("P1")
+	if err != nil || len(list) != 1 {
+		t.Fatalf("ListByPoint: %+v err=%v", list, err)
+	}
+	smp := list[0]
+	if smp.Status != StatusPending || smp.Results != nil || smp.Exceeded {
+		t.Fatalf("待判定样品读入后不应带结论: %+v", smp)
+	}
+	if len(smp.Measurements) != 1 || smp.Measurements[0].Item != openPH ||
+		smp.Measurements[0].Value != 0 {
+		t.Fatalf("零测量值必须原样保留: %+v", smp.Measurements)
+	}
+}
+
+// 样品集合为空的已有数据照常打开：需要拒绝的是已经存在却没有原测量的样品，
+// 而不是尚未录入样品的数据存放。
+func TestOpenEmptySamplesMap(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points:  openPoints(),
+		Samples: map[string]*Sample{},
+	})
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("空样品集合应照常打开: %v", err)
+	}
+	defer s.Close()
+	list, err := s.ListByPoint("P1")
+	if err != nil || len(list) != 0 {
+		t.Fatalf("空样品集合不应列出任何样品: %+v err=%v", list, err)
+	}
+	if _, ok, err := s.LatestResult("P1"); err != nil || ok {
+		t.Fatalf("空样品集合应无最近有效结果: ok=%v err=%v", ok, err)
+	}
 }

@@ -44,7 +44,7 @@ var (
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
 	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
-	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少原测量、测量项目重复或测量项目与逐项判定对应不上的损坏样品记录")
+	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少原测量、测量项目重复、测量项目与逐项判定对应不上，或超标标记与保存的测量值、上限及逐项结论不一致的损坏样品记录")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -127,14 +127,23 @@ type Store struct {
 // 必须按项目名完整一一对应；判定里同一项目不能出现两次；每个测量项目必须且
 // 只能有一条判定，判定里也不能出现原测量没有的项目；对应项目的判定测量值必须
 // 与原测量值一致（零是合法测量值，不会被当成缺项）。两个列表排列顺序不同不
-// 影响对应，成功读入后测量与判定各自保留原顺序。任一份样品对不上，整次打开
+// 影响对应，成功读入后测量与判定各自保留原顺序。再核对每条判定的超标标记：
+// 测量值严格大于该条保存的上限才应为超标，小于或等于上限（包括保存为零或负数
+// 的合法数值）都应为达标，单项标记与自身保存的测量值、上限矛盾即损坏；全部
+// 单项核对完后再核对整份样品的超标标记：有任意一项超标就应为真，全部达标则
+// 应为假，单项结论都正确但整份标记与逐项结论相反同样是损坏。核对只依据这份
+// 样品已经保存的判定内容（保存的上限与生效时间），不重新选择当前限值。任一
+// 份样品对不上，整次打开
 // 以可被 errors.Is(err, ErrCorruptRecord) 识别的错误失败，返回 nil 数据存放，
-// 错误信息点到具体样品编号与缺少原测量的原因（或具体项目）；不会静默跳过问题
-// 样品、不会择一保留或合并重复测量、不会补出缺失测量或判定、不会把它改成另一
-// 种状态、也不会把拒绝推迟到请求确认时，更不会改写原文件。待判定样品没有判定
+// 错误信息点到具体样品编号与缺少原测量的原因（单项标记矛盾时还点到具体项目；
+// 整份标记矛盾时说明它与逐项结论不一致）；不会静默跳过问题
+// 样品、不会择一保留或合并重复测量、不会补出缺失测量或判定、不会自动修正标记
+// 或重做判定、不会把问题样品退回待判定或改成作废、不会把拒绝推迟到请求确认时，
+// 更不会改写原文件。待判定样品没有判定
 // 记录、待判定后作废的样品没有历史依据，均属正常，只要原测量完整就照常读入。
-// 完整记录原样读入，已保存的上限、生效时间、逐项结论与整份超标标记保留，不因
-// 后来新增或补录的限值而拒绝或重新计算。没有任何样品的新数据目录，以及样品
+// 完整记录原样读入，已保存的上限、生效时间、逐项结论与整份超标标记保留；后来
+// 新增或补录的限值即使会使该样品重新判定为另一种结果，只要旧结论与旧依据一致，
+// 仍照常打开。没有任何样品的新数据目录，以及样品
 // 集合为空的已有数据，都照常打开。
 func Open(dir string) (*Store, error) {
 	if strings.TrimSpace(dir) == "" {
@@ -220,6 +229,14 @@ func Open(dir string) (*Store, error) {
 // 中是否存在该项目判断，不把零当成缺项）。项目按名称对应，与两个列表的排列
 // 顺序无关。key 是落盘 map 中的样品编号，用于在记录本身残缺（如空记录）时
 // 仍能指出是哪份样品。
+//
+// 在上述对应关系全部成立后，还要核对超标标记本身是否与保存的依据一致，依据
+// 仅限这份样品已经保存的判定内容，不重新选择当前限值。每条判定的 Exceeded
+// 必须等于“保存的测量值严格大于保存的上限”：value > limit 才应为 true，
+// value <= limit（包括零与负数等合法数值）都应为 false；保存的上限与生效时间
+// 原样保留，不因后来新增或补录的限值而重算。再核对整份样品的 Exceeded：任一
+// 条判定超标就应为 true，全部达标则应为 false。单项标记相反、或单项都正确
+// 但整份标记与逐项结论不一致，都按损坏处理，不能只检查其中一种。
 func validateLoadedSample(key string, smp *Sample) error {
 	if smp == nil {
 		return fmt.Errorf("%w: 样品 %s 的记录为空", ErrCorruptRecord, key)
@@ -274,7 +291,52 @@ func validateLoadedSample(key string, smp *Sample) error {
 				ErrCorruptRecord, id, r.Item)
 		}
 	}
+	// 对应关系全部成立后，再核对超标标记与保存的依据是否一致。依据仅限本份
+	// 样品已保存的判定内容（保存的测量值与上限），不重新选择当前限值，也不
+	// 因后来新增或补录的限值而重算。先逐条核对单项标记（按判定保存顺序报告，
+	// 保持信息稳定），再汇总核对整份标记：单项矛盾或整份标记与逐项结论相反
+	// 都算损坏，不能只检查其中一种。
+	anyExceeded := false
+	for _, r := range smp.Results {
+		want := r.Value > r.Limit
+		if r.Exceeded != want {
+			return fmt.Errorf("%w: 样品 %s 的项目 %s 超标标记与保存的判定依据矛盾：测量值 %g %s 上限 %g，应标为%s，实际标为%s",
+				ErrCorruptRecord, id, r.Item, r.Value, cmpText(r.Value, r.Limit), r.Limit,
+				exceededText(want), exceededText(r.Exceeded))
+		}
+		if want {
+			anyExceeded = true
+		}
+	}
+	if smp.Exceeded != anyExceeded {
+		if anyExceeded {
+			return fmt.Errorf("%w: 样品 %s 的整份超标标记与逐项结论不一致：存在超标项目却标为达标",
+				ErrCorruptRecord, id)
+		}
+		return fmt.Errorf("%w: 样品 %s 的整份超标标记与逐项结论不一致：全部项目达标却标为超标",
+			ErrCorruptRecord, id)
+	}
 	return nil
+}
+
+// cmpText 描述保存的测量值与上限之间实际成立的严格大小关系，用于损坏记录的
+// 错误信息，不参与任何判定计算。
+func cmpText(value, limit float64) string {
+	switch {
+	case value > limit:
+		return "严格大于"
+	case value < limit:
+		return "小于"
+	default:
+		return "等于"
+	}
+}
+
+func exceededText(exceeded bool) string {
+	if exceeded {
+		return "超标"
+	}
+	return "达标"
 }
 
 // Close 关闭数据存放。已保存的记录已落盘，重新 Open 同一目录即可查看。

@@ -10,13 +10,16 @@ import (
 	"time"
 )
 
-// 本文件保护“打开本地数据”时对已保存判定结论的完整性校验：
-// 只有原测量项目与逐项判定按项目名完整一一对应、且对应项目的测量值一致时，
-// 已确认样品才能被读入；缺项、多项、项目重复、测量值对不上（零也是合法
-// 测量值）或整份样品没有测量项目，都必须让整次 Open 失败，返回 nil 存放，
-// 错误信息点到具体样品编号与项目，且不覆盖原文件、不静默跳过、不补判定、
-// 不改成待判定。待判定样品、待判定后作废（无历史依据）的样品不受影响；
-// 已确认后作废但历史依据完整的样品继续兼容。
+// 本文件保护“打开本地数据”时对已保存记录的完整性校验：
+// 任何状态的样品，原测量中同一项目名都只能出现一次（与记录是否相邻、
+// 数值是否相同无关，两个零也是重复；不同项目都测得零则正常），待判定样品
+// 与从待判定直接作废、没有历史依据的样品也不例外；带判定结论的样品还要求
+// 原测量项目与逐项判定按项目名完整一一对应、且对应项目的测量值一致。
+// 缺项、多项、项目重复、测量值对不上（零也是合法测量值）或整份样品没有
+// 测量项目，都必须让整次 Open 失败，返回 nil 存放，错误信息点到具体样品
+// 编号与项目，且不覆盖原文件、不静默跳过、不选取或合并重复测量、不补判定、
+// 不改成待判定。待判定样品没有判定记录、待判定后作废（无历史依据）的样品
+// 不被要求已有判定依据；已确认后作废但历史依据完整的样品继续兼容。
 
 const (
 	openPH   = "pH"
@@ -522,4 +525,204 @@ func TestOpenNullSampleRecord(t *testing.T) {
 		},
 	})
 	assertOpenRejects(t, dir, "S1", "", true)
+}
+
+// 待判定样品的原测量里同一项目出现两次（两条 pH 都是零）：不能因为它还没有
+// 逐项判定就放行进台账，否则一旦存在适用上限，确认时会把两条测量都保存成
+// 判定依据。整次打开必须失败，点名样品与项目，原文件保持原样。
+func TestOpenPendingDuplicateMeasurementZeroValues(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		// 即使文件里已有适用上限，重复测量也要在确认之前、打开当时被拦下。
+		Limits: map[string][]Limit{
+			diskLimitKey("P1", openPH): {{PointID: "P1", Item: openPH, Value: 8, Effective: openEff()}},
+		},
+		Samples: map[string]*Sample{
+			"SP": {
+				ID: "SP", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{
+					{Item: openPH, Value: 0}, {Item: openPH, Value: 0},
+				},
+				Status: StatusPending,
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "SP", openPH, false)
+}
+
+// 从待判定直接作废、没有历史判定依据的样品，原测量项目重复同样在打开时拦下。
+func TestOpenVoidedWithoutResultsDuplicateMeasurement(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"SV": {
+				ID: "SV", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{
+					{Item: openPH, Value: 9},
+					{Item: openTurb, Value: 4},
+					{Item: openPH, Value: 3}, // 与第一条不相邻、数值也不同
+				},
+				Status: StatusVoided, VoidReason: "录入信息有误",
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "SV", openPH, false)
+}
+
+// 重复判断只看完整项目名：pH 与浊度都测得零是两个不同项目，不能误拒绝；
+// 同一份待判定样品因此正常读入，且不会凭空获得判定依据。
+func TestOpenPendingDifferentItemsBothZeroAllowed(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"SP": {
+				ID: "SP", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 0}, {Item: openTurb, Value: 0}},
+				Status:       StatusPending,
+			},
+		},
+	})
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("不同项目都测得零不是重复，应正常读入: %v", err)
+	}
+	defer s.Close()
+	list, err := s.ListByPoint("P1")
+	if err != nil || len(list) != 1 {
+		t.Fatalf("ListByPoint: %+v err=%v", list, err)
+	}
+	smp := list[0]
+	if smp.Status != StatusPending || smp.Results != nil || smp.Exceeded {
+		t.Fatalf("待判定样品读入后不应带结论: %+v", smp)
+	}
+	got := map[string]float64{}
+	for _, m := range smp.Measurements {
+		got[m.Item] = m.Value
+	}
+	if len(got) != 2 || got[openPH] != 0 || got[openTurb] != 0 {
+		t.Fatalf("两条不同项目的零测量应原样保留: %+v", smp.Measurements)
+	}
+}
+
+// 同一项目出现在不同样品中是正常记录：即使两份样品都有 pH（数值相同也算），
+// 打开仍成功；只有一份样品内部出现两条同名测量才是损坏。
+func TestOpenSameItemAcrossDifferentSamplesAllowed(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 0}},
+				Status:       StatusPending,
+			},
+			"S2": {
+				ID: "S2", PointID: "P1", SampledAt: at(11, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 0}, {Item: openTurb, Value: 0}},
+				Status:       StatusVoided, VoidReason: "录入信息有误",
+			},
+		},
+	})
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("同一项目分属不同样品是正常记录: %v", err)
+	}
+	defer s.Close()
+	if list, err := s.ListByPoint("P1"); err != nil || len(list) != 2 {
+		t.Fatalf("两份样品都应读入: %+v err=%v", list, err)
+	}
+}
+
+// 文件里另有多份完整样品，也不能只跳过带重复测量的待判定样品继续打开：
+// 整次失败、返回 nil 存放。
+func TestOpenPendingDuplicateRejectsWholeFile(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			// 完整、正常的已确认样品。
+			"S-GOOD": {
+				ID: "S-GOOD", PointID: "P1", SampledAt: at(5, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 7}},
+				Status:       StatusConfirmed, Exceeded: false,
+				Results: []ItemResult{
+					{Item: openPH, Value: 7, Limit: 8, LimitEffective: openEff(), Exceeded: false},
+				},
+			},
+			// 原测量项目重复的待判定样品。
+			"S-BAD": {
+				ID: "S-BAD", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{
+					{Item: openTurb, Value: 1},
+					{Item: openPH, Value: 9},
+					{Item: openTurb, Value: 1}, // 不相邻、数值相同仍是重复
+				},
+				Status: StatusPending,
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S-BAD", openTurb, false)
+}
+
+// 端到端复现修复点：正常写入的待判定样品重开后仍可确认，逐项依据恰好一条；
+// 而被外部改成两条同名测量的文件根本无法 Open，确认流程接触不到损坏记录。
+func TestOpenPendingDuplicateBlocksConfirm(t *testing.T) {
+	s, dir := open(t)
+	mustPoint(t, s, "P1", "一号取水口")
+	mustLimit(t, s, "P1", openPH, 8.0, openEff())
+	mustLimit(t, s, "P1", openTurb, 4.0, openEff())
+	mustSample(t, s, "S1", "P1", at(10, 0),
+		Measurement{Item: openPH, Value: 9}, Measurement{Item: openTurb, Value: 4})
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 正常文件：重开后确认成功，每个项目恰好一条判定依据。
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("正常待判定样品应能重开: %v", err)
+	}
+	conf, err := s2.Confirm("S1")
+	if err != nil {
+		t.Fatalf("正常样品确认: %v", err)
+	}
+	if len(conf.Results) != 2 {
+		t.Fatalf("每个项目应恰好一条判定依据: %+v", conf.Results)
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatalf("Close s2: %v", err)
+	}
+
+	// 外部改动：给待判定样品再塞一条同名 pH（两条数值相同）。
+	var st diskState
+	raw, err := os.ReadFile(filepath.Join(dir, "water-data.json"))
+	if err != nil {
+		t.Fatalf("read data file: %v", err)
+	}
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatalf("unmarshal data file: %v", err)
+	}
+	st.Samples["S1"].Status = StatusPending
+	st.Samples["S1"].Results = nil
+	st.Samples["S1"].Exceeded = false
+	st.Samples["S1"].Measurements = append(st.Samples["S1"].Measurements,
+		Measurement{Item: openPH, Value: 9})
+	writeDiskFile(t, dir, st)
+
+	got, err := Open(dir)
+	if err == nil {
+		if got != nil {
+			got.Close()
+		}
+		t.Fatalf("被外部塞入重复测量的文件必须整次 Open 失败")
+	}
+	if got != nil {
+		t.Fatalf("打开失败时不得返回可用的数据存放对象，got %#v", got)
+	}
+	if !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("应返回 ErrCorruptRecord，got %v", err)
+	}
 }

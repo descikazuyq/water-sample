@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Status 表示样品所处的判定状态。
@@ -42,6 +43,7 @@ var (
 	ErrMissingLimit       = errors.New("water: 存在找不到适用上限的测量项目")
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
+	ErrInvalidEncoding    = errors.New("water: 文本必须是有效的 UTF-8 编码")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -280,6 +282,8 @@ func (s *Store) SetLimit(pointID, item string, value float64, effective time.Tim
 }
 
 // SubmitSample 录入一份样品，初始为待判定状态。
+// 编号、采样点编号和每个项目名必须是有效的 UTF-8 文本，否则整份提交拒绝：
+// 无效字节保存为 JSON 时会被替换成 U+FFFD，录入内容将与落盘内容不一致。
 // 再次提交同一编号且内容相同（项目排列顺序不同不算变化）返回原样品；
 // 任一内容不同则拒绝整个提交，已确认或已作废的样品同样遵守。
 func (s *Store) SubmitSample(id, pointID string, sampledAt time.Time, measurements ...Measurement) (Sample, error) {
@@ -289,6 +293,12 @@ func (s *Store) SubmitSample(id, pointID string, sampledAt time.Time, measuremen
 		return Sample{}, err
 	}
 	id, pointID = clean(id), clean(pointID)
+	if !utf8.ValidString(id) {
+		return Sample{}, fmt.Errorf("%w: 样品编号", ErrInvalidEncoding)
+	}
+	if !utf8.ValidString(pointID) {
+		return Sample{}, fmt.Errorf("%w: 采样点编号", ErrInvalidEncoding)
+	}
 	if id == "" || pointID == "" {
 		return Sample{}, ErrEmptyField
 	}
@@ -302,6 +312,9 @@ func (s *Store) SubmitSample(id, pointID string, sampledAt time.Time, measuremen
 	seen := make(map[string]float64, len(measurements))
 	for i, m := range measurements {
 		item := clean(m.Item)
+		if !utf8.ValidString(item) {
+			return Sample{}, fmt.Errorf("%w: 测量项目名", ErrInvalidEncoding)
+		}
 		if item == "" {
 			return Sample{}, ErrEmptyField
 		}

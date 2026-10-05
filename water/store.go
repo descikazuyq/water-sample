@@ -43,7 +43,7 @@ var (
 	ErrMissingLimit       = errors.New("water: 存在找不到适用上限的测量项目")
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
-	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名或样品编号不是合法的 UTF-8 文本")
+	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -474,12 +474,25 @@ func applicableLimit(versions []Limit, at time.Time) (Limit, bool) {
 }
 
 // Void 作废样品。原因去掉首尾空白后不能为空；待判定和已确认的样品都能作废。
-// 作废后保留测量、原因和已有结果；重复提交处理后相同的原因返回原记录，不同则拒绝。
+// 作废原因必须是合法的 UTF-8 文本：原始原因含孤立的 0xFF、0xFE 字节或不完整
+// 的多字节序列等无法原样保存的内容时，本次作废整体以 ErrInvalidText 拒绝，
+// 返回空样品，不删除或替换任何字节、不改动样品状态与已有原因；即使样品编号
+// 不存在，或样品已作废而这次原因与原原因不同，也报告文本编码错误，而不是
+// 样品不存在或原因冲突（数据存放已关闭时仍返回 ErrClosed）。真正的 U+FFFD
+// （“�”）、中文、表情和文本内部的 U+0000 仍是合法字符。作废后保留测量、原因
+// 和已有结果；重复提交处理后相同的原因返回原记录，不同则拒绝。
 func (s *Store) Void(id, reason string) (Sample, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkOpenLocked(); err != nil {
 		return Sample{}, err
+	}
+	// 在去首尾空白、查找样品和比对原因等任何处理之前检查原始原因：落盘 JSON
+	// 会把非法 UTF-8 静默替换成 U+FFFD，作废“成功”后当场返回的原因仍带原始
+	// 字节，保存与重开后却变成替换字符，同一记录前后对不上，再次提交原原因
+	// 还会被误判成原因冲突；只有整次拒绝才能保证原因在保存前后一致。
+	if invalidUTF8(reason) {
+		return Sample{}, ErrInvalidText
 	}
 	id, reason = clean(id), clean(reason)
 	if id == "" || reason == "" {

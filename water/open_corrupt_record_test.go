@@ -18,8 +18,12 @@ import (
 // 测量值一致；缺项、多项、判定项目重复、测量值对不上（零也是合法测量值）或
 // 整份样品没有测量项目，都必须让整次 Open 失败，返回 nil 存放，错误信息点到
 // 具体样品编号与项目，且不覆盖原文件、不静默跳过、不择一保留或合并重复测量、
-// 不补判定、不改成待判定。待判定样品、待判定后作废（无历史依据）的样品在原测量
-// 不重复时不受影响；已确认后作废但历史依据完整的样品继续兼容。
+// 不补判定、不改成待判定。超标标记还必须与这份样品已保存的判定依据一致：
+// 每条判定测量值严格大于其保存的上限才应为超标，小于或等于（含等于、零或负数
+// 组合）都应为达标；整份标记必须与逐项结论一致，任一超标即为真、全部达标即为
+// 假。单项标记相反，或单项都对而整份标记相反，都让整次 Open 失败；不修正标记、
+// 不按当前限值重做判定。待判定样品、待判定后作废（无历史依据）的样品在原测量
+// 不重复时不受影响；已确认后作废但历史依据完整且标记一致的样品继续兼容。
 
 const (
 	openPH   = "pH"
@@ -895,4 +899,377 @@ func TestOpenEmptySampleStore(t *testing.T) {
 	if list, err := s3.ListByPoint("P1"); err != nil || len(list) != 0 {
 		t.Fatalf("样品字段缺失应没有样品: %+v err=%v", list, err)
 	}
+}
+
+// assertOpenRejectsWholeFlag 断言整份超标标记与逐项结论矛盾时整次 Open 失败：
+// 返回 nil 存放、ErrCorruptRecord、信息点名样品编号并说明与逐项结论不一致，
+// 原文件字节不变；不要求信息里出现某个项目名。
+func assertOpenRejectsWholeFlag(t *testing.T, dir, sampleID string) {
+	t.Helper()
+	before, err := os.ReadFile(filepath.Join(dir, "water-data.json"))
+	if err != nil {
+		t.Fatalf("read file before open: %v", err)
+	}
+	got, err := Open(dir)
+	if err == nil {
+		if got != nil {
+			got.Close()
+		}
+		t.Fatalf("整份标记矛盾必须让整次 Open 失败，sample=%s", sampleID)
+	}
+	if got != nil {
+		t.Fatalf("打开失败时不得返回可用的数据存放对象，got %#v", got)
+	}
+	if !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("应返回 ErrCorruptRecord，got %v", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, sampleID) {
+		t.Fatalf("错误信息应指出样品编号 %q，实际 %q", sampleID, msg)
+	}
+	if !strings.Contains(msg, "逐项") {
+		t.Fatalf("错误信息应说明整份标记与逐项结论不一致，实际 %q", msg)
+	}
+	after, rerr := os.ReadFile(filepath.Join(dir, "water-data.json"))
+	if rerr != nil {
+		t.Fatalf("read file after open: %v", rerr)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("打开失败不得覆盖或改写原数据文件")
+	}
+}
+
+// 测量值 9、上限 8 的判定却保存为达标：即使项目、测量值都对得上，也不能把
+// 与依据矛盾的超标标记当成可信结论，整次打开失败并点名样品与项目。
+func TestOpenItemExceededMarkedCompliant(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 9}},
+				// 单项与整份都错成“达标”，单项矛盾必须先报出并点名项目。
+				Status: StatusConfirmed, Exceeded: false,
+				Results: []ItemResult{
+					{Item: openPH, Value: 9, Limit: 8, LimitEffective: openEff(), Exceeded: false},
+				},
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", openPH, false)
+}
+
+// 测量值 7、上限 8 的达标判定却保存为超标：反向标错同样拒绝。
+func TestOpenItemCompliantMarkedExceeded(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 7}},
+				// 单项错成超标；整份标记与错误的单项保持一致，
+				// 证明只核对单项标记与保存依据这一条也足以拒绝。
+				Status: StatusConfirmed, Exceeded: true,
+				Results: []ItemResult{
+					{Item: openPH, Value: 7, Limit: 8, LimitEffective: openEff(), Exceeded: true},
+				},
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", openPH, false)
+}
+
+// 测量值恰好等于上限必须判为达标：保存成超标就是矛盾记录。
+func TestOpenItemEqualLimitMarkedExceeded(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 8}},
+				Status:       StatusConfirmed, Exceeded: true,
+				Results: []ItemResult{
+					{Item: openPH, Value: 8, Limit: 8, LimitEffective: openEff(), Exceeded: true},
+				},
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", openPH, false)
+}
+
+// 零与负数的合法数值组合同样按“严格大于”判断。
+func TestOpenItemZeroAndNegativeFlags(t *testing.T) {
+	cases := []struct {
+		name         string
+		value        float64
+		limit        float64
+		savedFlag    bool
+		wantExceed   bool
+		shouldReject bool
+	}{
+		{"零等于零标成超标", 0, 0, true, false, true},
+		{"零小于正上限标成超标", 0, 4, true, false, true},
+		{"零大于负上限却标成达标", 0, -1, false, true, true},
+		{"负数严格大于负上限却标成达标", -5, -10, false, true, true},
+		{"负数等于负上限标成超标", -5, -5, true, false, true},
+		{"负数小于负上限标成达标（正常）", -10, -5, false, false, false},
+		{"零等于零标成达标（正常）", 0, 0, false, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeDiskFile(t, dir, diskState{
+				Points: openPoints(),
+				Samples: map[string]*Sample{
+					"S1": {
+						ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+						Measurements: []Measurement{{Item: openPH, Value: c.value}},
+						// 整份标记与逐项实际结论一致，隔离出单项标记这一条核对。
+						Status: StatusConfirmed, Exceeded: c.wantExceed,
+						Results: []ItemResult{
+							{Item: openPH, Value: c.value, Limit: c.limit, LimitEffective: openEff(), Exceeded: c.savedFlag},
+						},
+					},
+				},
+			})
+			if c.shouldReject {
+				assertOpenRejects(t, dir, "S1", openPH, false)
+				return
+			}
+			s, err := Open(dir)
+			if err != nil {
+				t.Fatalf("标记与保存依据一致的合法数值组合应正常读入: %v", err)
+			}
+			defer s.Close()
+			latest, ok, err := s.LatestResult("P1")
+			if err != nil || !ok {
+				t.Fatalf("正常记录应可作为最近有效结果: %+v ok=%v err=%v", latest, ok, err)
+			}
+			r := latest.Results[0]
+			if r.Value != c.value || r.Limit != c.limit || r.Exceeded != c.wantExceed ||
+				latest.Exceeded != c.wantExceed {
+				t.Fatalf("保存的依据与标记应原样保留: %+v exceeded=%v", r, latest.Exceeded)
+			}
+		})
+	}
+}
+
+// 逐项标记都正确（pH 9>8 超标、浊度 4=4 达标），整份标记却保存成达标：
+// 单项核对放过、整份核对必须拦住，错误说明它与逐项结论不一致。
+func TestOpenWholeFlagShouldBeExceeded(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: phTurbMeasurements(),
+				Status:       StatusConfirmed, Exceeded: false,
+				Results: phTurbResults(),
+			},
+		},
+	})
+	assertOpenRejectsWholeFlag(t, dir, "S1")
+}
+
+// 逐项全部达标，整份标记却保存成超标：反方向的整份标记矛盾同样拒绝。
+func TestOpenWholeFlagShouldBeCompliant(t *testing.T) {
+	dir := t.TempDir()
+	results := []ItemResult{
+		{Item: openPH, Value: 7, Limit: 8, LimitEffective: openEff(), Exceeded: false},
+		{Item: openTurb, Value: 4, Limit: 4, LimitEffective: openEff(), Exceeded: false},
+	}
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 7}, {Item: openTurb, Value: 4}},
+				Status:       StatusConfirmed, Exceeded: true,
+				Results: results,
+			},
+		},
+	})
+	assertOpenRejectsWholeFlag(t, dir, "S1")
+}
+
+// 已确认后作废、逐项依据仍保留的样品，超标标记与依据矛盾时同样拒绝：
+// 作废只取消有效资格，不能让错误结论借“历史记录”名义混入台账。
+func TestOpenVoidedAfterConfirmedItemFlagContradiction(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 9}},
+				Status:       StatusVoided, VoidReason: "复测确认样品污染", Exceeded: false,
+				Results: []ItemResult{
+					{Item: openPH, Value: 9, Limit: 8, LimitEffective: openEff(), Exceeded: false},
+				},
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", openPH, false)
+}
+
+// 已确认后作废的样品单项都对、整份标记反了：同样整次拒绝并说明与逐项结论不一致。
+func TestOpenVoidedAfterConfirmedWholeFlagContradiction(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 9}},
+				Status:       StatusVoided, VoidReason: "复测确认样品污染", Exceeded: false,
+				Results: []ItemResult{
+					{Item: openPH, Value: 9, Limit: 8, LimitEffective: openEff(), Exceeded: true},
+				},
+			},
+		},
+	})
+	assertOpenRejectsWholeFlag(t, dir, "S1")
+}
+
+// 一个文件里其他样品正常，也不能只跳过标记矛盾的样品继续打开。
+func TestOpenFlagContradictionRejectsWholeFile(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			// 完整、正常的已确认样品。
+			"S-GOOD": {
+				ID: "S-GOOD", PointID: "P1", SampledAt: at(5, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 7}},
+				Status:       StatusConfirmed, Exceeded: false,
+				Results: []ItemResult{
+					{Item: openPH, Value: 7, Limit: 8, LimitEffective: openEff(), Exceeded: false},
+				},
+			},
+			// 测量值 9、上限 8 却标成达标的损坏样品。
+			"S-BAD": {
+				ID: "S-BAD", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 9}},
+				Status:       StatusConfirmed, Exceeded: false,
+				Results: []ItemResult{
+					{Item: openPH, Value: 9, Limit: 8, LimitEffective: openEff(), Exceeded: false},
+				},
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S-BAD", openPH, false)
+}
+
+// 核对只针对这份样品已保存的判定依据：保存的上限是 100、测量值 9 且标记达标，
+// 即使文件里另有当前会选到的更严限值（8，超标），只要旧结论与旧依据一致就
+// 照常打开，所用上限、生效时间和结论原样保留，不重新选择限值、不重做判定。
+func TestOpenFlagCheckedAgainstSavedBasisOnly(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Limits: map[string][]Limit{
+			diskLimitKey("P1", openPH): {
+				{PointID: "P1", Item: openPH, Value: 8, Effective: at(1, 0)},
+			},
+		},
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 9}},
+				Status:       StatusConfirmed, Exceeded: false,
+				Results: []ItemResult{
+					// 保存的旧依据是 9 <= 100 达标；按当前限值 8 重算会变成超标。
+					{Item: openPH, Value: 9, Limit: 100, LimitEffective: at(2, 0), Exceeded: false},
+				},
+			},
+		},
+	})
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("旧结论与旧依据一致时应正常读入，不能按当前限值重判: %v", err)
+	}
+	defer s.Close()
+	latest, ok, err := s.LatestResult("P1")
+	if err != nil || !ok || latest.ID != "S1" {
+		t.Fatalf("正常记录应可作为最近有效结果: %+v ok=%v err=%v", latest, ok, err)
+	}
+	r := latest.Results[0]
+	if r.Value != 9 || r.Limit != 100 || !r.LimitEffective.Equal(at(2, 0)) || r.Exceeded || latest.Exceeded {
+		t.Fatalf("旧上限、生效时间与达标结论必须原样保留: %+v exceeded=%v", r, latest.Exceeded)
+	}
+}
+
+// 保存依据是 9 <= 100 达标，却把单项标记写成超标：即使该标记恰好与当前更严
+// 限值（8）会得出的结论相同，它仍与这份样品保存的依据矛盾，必须拒绝。
+func TestOpenFlagContradictsSavedBasisEvenIfCurrentLimitAgrees(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Limits: map[string][]Limit{
+			diskLimitKey("P1", openPH): {
+				{PointID: "P1", Item: openPH, Value: 8, Effective: at(1, 0)},
+			},
+		},
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 9}},
+				Status:       StatusConfirmed, Exceeded: true,
+				Results: []ItemResult{
+					{Item: openPH, Value: 9, Limit: 100, LimitEffective: at(2, 0), Exceeded: true},
+				},
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", openPH, false)
+}
+
+// 待判定样品没有判定依据，其整份超标标记零值 false 不参与核对，照常读入。
+func TestOpenPendingWholeFlagNotChecked(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 9}},
+				Status:       StatusPending,
+			},
+		},
+	})
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("待判定样品没有判定依据，不应核对超标标记: %v", err)
+	}
+	defer s.Close()
+	if latest, ok, err := s.LatestResult("P1"); err != nil || ok {
+		t.Fatalf("待判定样品不能成为最近有效结果: %+v ok=%v err=%v", latest, ok, err)
+	}
+}
+
+// 多项样品中只有一项标记相反：整次失败并点名出问题的项目，
+// 且不改动原文件中的任何标记。
+func TestOpenOneWrongItemFlagAmongMany(t *testing.T) {
+	dir := t.TempDir()
+	results := []ItemResult{
+		{Item: openPH, Value: 9, Limit: 8, LimitEffective: openEff(), Exceeded: true},
+		// 浊度 4 <= 4 应为达标，却保存成超标；整份标记与逐项实际结论一致（true）。
+		{Item: openTurb, Value: 4, Limit: 4, LimitEffective: openEff(), Exceeded: true},
+	}
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: phTurbMeasurements(),
+				Status:       StatusConfirmed, Exceeded: true,
+				Results: results,
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", openTurb, false)
 }

@@ -676,3 +676,223 @@ func TestOpenPendingDuplicateRejectsWholeFile(t *testing.T) {
 	})
 	assertOpenRejects(t, dir, "S-BAD", openPH, false)
 }
+
+// 待判定样品丢失全部原测量（空列表）：即使编号、采样点、采样时间齐全，
+// 也不能读入；否则请求确认会得到没有逐项依据、超标标记为假的“已确认”记录，
+// 还可能被当成采样点的最近有效结果。
+func TestOpenPendingNoMeasurements(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: []Measurement{},
+				Status:       StatusPending,
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", "", true)
+}
+
+// 待判定样品的原测量保存为 JSON null：与空列表一样是内容残缺，整次打开失败。
+func TestOpenPendingNilMeasurements(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: nil,
+				Status:       StatusPending,
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", "", true)
+}
+
+// 原测量字段在文件中整个缺失（JSON 反序列化后为 nil），同样必须拒绝。
+// 这里直接写出不含 measurements 字段的 JSON，而不是依赖 Go 结构体序列化。
+func TestOpenPendingMissingMeasurementsField(t *testing.T) {
+	dir := t.TempDir()
+	raw := `{
+  "points": {"P1": {"id": "P1", "name": "一号取水口"}},
+  "samples": {
+    "S1": {"id": "S1", "pointId": "P1", "sampledAt": "` +
+		at(10, 0).Format(time.RFC3339Nano) + `", "status": "pending"}
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "water-data.json"), []byte(raw), 0o644); err != nil {
+		t.Fatalf("write data file: %v", err)
+	}
+	assertOpenRejects(t, dir, "S1", "", true)
+}
+
+// 待判定后直接作废、没有历史结论的样品丢失全部原测量，同样不能因为它不再
+// 参与有效判定就放过内容丢失：整次打开失败。
+func TestOpenVoidedFromPendingNoMeasurements(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: nil,
+				Status:       StatusVoided, VoidReason: "录入信息有误",
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", "", true)
+}
+
+// 已作废样品的原测量为空但仍残留逐项判定：不能反过来用判定内容填补原测量，
+// 整次打开失败。
+func TestOpenVoidedNoMeasurementsWithLeftoverResults(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: nil,
+				Status:       StatusVoided, VoidReason: "复测确认样品污染", Exceeded: true,
+				Results: []ItemResult{
+					{Item: openPH, Value: 9, Limit: 8, LimitEffective: openEff(), Exceeded: true},
+				},
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", "", true)
+}
+
+// 已确认样品原测量为空、只剩残留判定和整份超标标记，不能凭标记取得达标或
+// 超标资格：整次打开失败。
+func TestOpenConfirmedNoMeasurementsWithLeftoverResults(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			"S1": {
+				ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: nil,
+				Status:       StatusConfirmed, Exceeded: false,
+				Results: []ItemResult{
+					{Item: openPH, Value: 7, Limit: 8, LimitEffective: openEff(), Exceeded: false},
+				},
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S1", "", true)
+}
+
+// 一份丢失原测量的待判定样品与其他完整样品同处一个文件：整次失败、无可用
+// 存放，完整样品也不能被部分读入；原文件保持原样。
+func TestOpenNoMeasurementsRejectsWholeFile(t *testing.T) {
+	dir := t.TempDir()
+	writeDiskFile(t, dir, diskState{
+		Points: openPoints(),
+		Samples: map[string]*Sample{
+			// 完整、正常的待判定样品。
+			"S-GOOD": {
+				ID: "S-GOOD", PointID: "P1", SampledAt: at(5, 0),
+				Measurements: []Measurement{{Item: openPH, Value: 7}},
+				Status:       StatusPending,
+			},
+			// 丢失全部原测量的待判定样品。
+			"S-BAD": {
+				ID: "S-BAD", PointID: "P1", SampledAt: at(10, 0),
+				Measurements: nil,
+				Status:       StatusPending,
+			},
+		},
+	})
+	assertOpenRejects(t, dir, "S-BAD", "", true)
+}
+
+// 只含一个项目且测量值为零的样品并不为空：零值和原状态都必须保留。
+func TestOpenSingleZeroMeasurementIsNotEmpty(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		status Status
+		reason string
+	}{
+		{"待判定", StatusPending, ""},
+		{"待判定后作废", StatusVoided, "录入信息有误"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeDiskFile(t, dir, diskState{
+				Points: openPoints(),
+				Samples: map[string]*Sample{
+					"S1": {
+						ID: "S1", PointID: "P1", SampledAt: at(10, 0),
+						Measurements: []Measurement{{Item: openPH, Value: 0}},
+						Status:       c.status, VoidReason: c.reason,
+					},
+				},
+			})
+			s, err := Open(dir)
+			if err != nil {
+				t.Fatalf("单项目零测量不是空样品，应正常读入: %v", err)
+			}
+			defer s.Close()
+			list, err := s.ListByPoint("P1")
+			if err != nil || len(list) != 1 {
+				t.Fatalf("ListByPoint: %+v err=%v", list, err)
+			}
+			smp := list[0]
+			if len(smp.Measurements) != 1 || smp.Measurements[0].Item != openPH ||
+				smp.Measurements[0].Value != 0 {
+				t.Fatalf("零测量值必须原样保留: %+v", smp.Measurements)
+			}
+			if smp.Status != c.status || smp.VoidReason != c.reason {
+				t.Fatalf("原状态必须保留: %+v", smp)
+			}
+		})
+	}
+}
+
+// 没有任何样品的新数据目录，以及样品集合为空的已有数据文件，都应照常打开；
+// 需要拒绝的是已经存在却没有原测量的样品，而不是尚未录入样品的数据存放。
+func TestOpenEmptySampleStore(t *testing.T) {
+	// 全新目录：数据文件尚不存在。
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("全新数据目录应正常打开: %v", err)
+	}
+	if list, err := s.ListByPoint("P1"); err != nil || len(list) != 0 {
+		t.Fatalf("全新目录应没有样品: %+v err=%v", list, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 已有数据文件但样品集合为空（map 为空）。
+	writeDiskFile(t, dir, diskState{
+		Points:  openPoints(),
+		Samples: map[string]*Sample{},
+	})
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("样品集合为空的已有数据应正常打开: %v", err)
+	}
+	defer s2.Close()
+	if list, err := s2.ListByPoint("P1"); err != nil || len(list) != 0 {
+		t.Fatalf("空样品集合应没有样品: %+v err=%v", list, err)
+	}
+
+	// 已有数据文件但样品字段整体缺失（JSON null）。
+	raw := `{"points": {"P1": {"id": "P1", "name": "一号取水口"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "water-data.json"), []byte(raw), 0o644); err != nil {
+		t.Fatalf("write data file: %v", err)
+	}
+	s3, err := Open(dir)
+	if err != nil {
+		t.Fatalf("样品字段缺失的已有数据应正常打开: %v", err)
+	}
+	defer s3.Close()
+	if list, err := s3.ListByPoint("P1"); err != nil || len(list) != 0 {
+		t.Fatalf("样品字段缺失应没有样品: %+v err=%v", list, err)
+	}
+}

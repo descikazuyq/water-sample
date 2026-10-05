@@ -43,7 +43,7 @@ var (
 	ErrMissingLimit       = errors.New("water: 存在找不到适用上限的测量项目")
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
-	ErrInvalidText        = errors.New("water: 样品编号、采样点编号或项目名不是合法的 UTF-8 文本")
+	ErrInvalidText        = errors.New("water: 采样点编号、采样点名称、样品编号或项目名不是合法的 UTF-8 文本")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -222,11 +222,24 @@ func (s *Store) persistLocked() error {
 
 // RegisterPoint 登记采样点。编号、名称去掉首尾空白后不能为空，
 // 保存和比较均使用处理后的文本；重复编号拒绝。
+// 编号和名称必须是合法的 UTF-8 文本：任一字段含孤立的 0xFF、0xFE 字节或
+// 不完整的多字节序列等无法原样保存的内容时，整次登记以 ErrInvalidText 拒绝，
+// 不占用编号，也不改变已有采样点的名称及其关联记录；真正的 U+FFFD（“�”）、
+// 中文和文本内部的 U+0000 仍是合法字符。即使另一项为空白，或编号已登记而
+// 这次名称含非法字节，也报告文本编码错误。
 func (s *Store) RegisterPoint(id, name string) (SamplingPoint, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkOpenLocked(); err != nil {
 		return SamplingPoint{}, err
+	}
+	// 在去首尾空白和其它任何处理之前检查原始文本：落盘 JSON 会把非法 UTF-8
+	// 静默替换成 U+FFFD，登记“成功”后保存的编号或名称就会与填写内容对不上，
+	// 两个不同编号（如末尾分别为孤立 0xFF、0xFE）还可能变成同一编号；只有
+	// 整次拒绝才能保证采样点身份在保存前后一致。即使另一项为空白，或编号
+	// 已登记而名称含非法字节，也必须报告编码问题。
+	if invalidUTF8(id) || invalidUTF8(name) {
+		return SamplingPoint{}, ErrInvalidText
 	}
 	id, name = clean(id), clean(name)
 	if id == "" || name == "" {

@@ -44,6 +44,9 @@ var (
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
 	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
+	// ErrCorruptRecord 表示本地数据文件中某份样品的记录已损坏：
+	// 已确认（含确认后作废）样品的逐项判定无法与原测量项目完整对应。
+	ErrCorruptRecord = errors.New("water: 本地数据文件中的样品记录不完整或与原测量不一致")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -114,6 +117,12 @@ type Store struct {
 }
 
 // Open 打开（必要时创建）dir 下的本地数据存放。
+// 已确认（含确认后作废）样品读入前必须通过依据完整性核对：每份至少一个
+// 测量项目，逐项判定与原测量按项目名称一一对应（不缺项、不多项、两侧均无
+// 重复项目），且每条判定的测量值与原记录一致；排列顺序不影响对应。
+// 任一份样品不合规时整次打开失败，返回可被 errors.Is(err, ErrCorruptRecord)
+// 识别的错误和空存放指针，不跳过该样品、不补判定、不改状态或覆盖文件。
+// 待判定样品、未确认即作废的样品没有判定依据，属正常情况，照常读入。
 func Open(dir string) (*Store, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, fmt.Errorf("%w: 数据目录", ErrEmptyField)
@@ -158,9 +167,81 @@ func Open(dir string) (*Store, error) {
 		}
 	}
 	if st.Samples != nil {
+		// 读入前逐份核对：已确认（含确认后作废）样品的逐项判定必须与原测量
+		// 项目一一对应——每份至少一个测量项目，每个项目有且仅有一条判定，
+		// 判定中不能出现原测量没有的项目，任一侧项目重复、对应测量值不一致
+		// 都说明文件里的结论已损坏。任何一份不合规都整体拒绝打开，不静默
+		// 跳过、不补判定、不改待判定或覆盖文件；待判定与未确认即作废的样品
+		// 没有判定依据，属于正常情况。
+		for _, smp := range st.Samples {
+			if err := validateSampleBasisLocked(smp); err != nil {
+				return nil, err
+			}
+		}
 		s.samples = st.Samples
 	}
 	return s, nil
+}
+
+// validateSampleBasisLocked 核对一份待读入样品的判定依据是否与原测量完整对应。
+// 只对带判定依据的状态（已确认、已确认后作废）生效：待判定样品没有判定记录、
+// 待判定后作废的样品没有历史依据，均不核对。按项目名称对应，两个列表各自的
+// 原有排列与对应关系无关；测量值零是合法值，不能被当成未填写。
+// 不合规时返回可被 errors.Is(err, ErrCorruptRecord) 识别的错误，并在错误信息中
+// 指出样品编号与具体项目（没有测量项目时只指出样品编号）。
+func validateSampleBasisLocked(smp *Sample) error {
+	if smp == nil || (smp.Status != StatusConfirmed && smp.Status != StatusVoided) {
+		return nil
+	}
+	// 从未确认就作废的样品没有历史依据，这是正常情况；已确认样品以及确认后
+	// 作废的样品只要处在这个分支，就必须带着与原测量完整对应的逐项判定。
+	if smp.Status == StatusVoided && len(smp.Results) == 0 {
+		return nil
+	}
+	ident := func() string {
+		if smp == nil || smp.ID == "" {
+			return "<未编号样品>"
+		}
+		return smp.ID
+	}
+	corrupt := func(detail string) error {
+		return fmt.Errorf("%w: 样品 %s 的%s", ErrCorruptRecord, ident(), detail)
+	}
+	if len(smp.Measurements) == 0 {
+		return corrupt("测量项目缺失：每份样品至少要有一个测量项目")
+	}
+	// 先查原测量自身的重复项目：同一项目出现两次即记录有误。
+	measured := make(map[string]float64, len(smp.Measurements))
+	for _, m := range smp.Measurements {
+		if _, dup := measured[m.Item]; dup {
+			return corrupt(fmt.Sprintf("项目 %s 在原测量中重复出现", m.Item))
+		}
+		measured[m.Item] = m.Value
+	}
+	// 判定侧同样不能有重复项目，且每条判定的测量值必须与原记录一致，
+	// 不能接受项目同名但测量值属于另一份记录的判定；零值是合法测量值。
+	// 一条判定都没有时，下面的缺项核对会逐一点名缺失的项目。
+	judged := make(map[string]float64, len(smp.Results))
+	for _, r := range smp.Results {
+		if _, dup := judged[r.Item]; dup {
+			return corrupt(fmt.Sprintf("项目 %s 在逐项判定中重复出现", r.Item))
+		}
+		judged[r.Item] = r.Value
+		want, ok := measured[r.Item]
+		if !ok {
+			return corrupt(fmt.Sprintf("项目 %s 不在原测量项目中", r.Item))
+		}
+		if r.Value != want {
+			return corrupt(fmt.Sprintf("项目 %s 的判定测量值 %g 与原测量值 %g 不一致", r.Item, r.Value, want))
+		}
+	}
+	// 每个原测量项目必须且只能对应一条判定：缺项的记录不能作为有效结论。
+	for _, m := range smp.Measurements {
+		if _, ok := judged[m.Item]; !ok {
+			return corrupt(fmt.Sprintf("项目 %s 缺少逐项判定记录", m.Item))
+		}
+	}
+	return nil
 }
 
 // Close 关闭数据存放。已保存的记录已落盘，重新 Open 同一目录即可查看。

@@ -665,28 +665,48 @@ func validateLoadedSample(key string, smp *Sample, missing missingFields) error 
 				ErrCorruptRecord, id, r.Item)
 		}
 	}
-	// 超标标记必须与这份样品已保存的判定依据一致。只按每条记录保存的测量值与
-	// 上限判断：严格大于才超标，小于或等于（含等于、零或负数的合法组合）都为
-	// 达标；不重新选择当前限值。单项标记与依据矛盾时点名该项目，整份标记与
-	// 逐项结论矛盾时单独说明。整份样品只允许一种矛盾先报出，但两者都会拒绝。
-	anyExceeded := false
+	// 超标标记必须与这份样品已保存的判定依据一致。单项的超标与否由共用的
+	// itemExceeded 判定（与确认新样品时同一规则：严格大于才超标，小于或等于
+	// 含等于、零或负数的合法组合都为达标），整份结论由 overallExceeded 汇总
+	// （任一单项超标即为真）。这里只按每条记录保存的测量值与上限判断，不重新
+	// 选择当前限值；单项标记与依据矛盾时点名该项目，整份标记与逐项结论矛盾时
+	// 单独说明。整份样品只允许一种矛盾先报出，但两者都会拒绝。
+	itemFlags := make([]bool, 0, len(smp.Results))
 	for _, r := range smp.Results {
-		want := r.Value > r.Limit
+		want := itemExceeded(r.Value, r.Limit)
 		if r.Exceeded != want {
 			return fmt.Errorf("%w: 样品 %s 的项目 %s 超标标记与保存的判定依据不一致：测量值 %g %s 上限 %g 应判为%s，却保存为%s",
 				ErrCorruptRecord, id, r.Item, r.Value, cmpText(r.Value, r.Limit), r.Limit,
 				judgementText(want), judgementText(r.Exceeded))
 		}
-		if want {
-			anyExceeded = true
-		}
+		itemFlags = append(itemFlags, want)
 	}
+	anyExceeded := overallExceeded(itemFlags)
 	if smp.Exceeded != anyExceeded {
 		return fmt.Errorf("%w: 样品 %s 的整份超标标记与逐项判定结论不一致：逐项判定中%s，整份标记却保存为%s",
 			ErrCorruptRecord, id,
 			overallText(anyExceeded), judgementText(smp.Exceeded))
 	}
 	return nil
+}
+
+// itemExceeded 是“测量值是否超过所用上限”的唯一比较规则：测量值严格大于
+// 上限才超标，小于或等于（包括恰好等于，以及零与负数的合法数值组合）都达标。
+// 确认待判定样品与打开已有数据时核对已保存的判定标记都经过这里，保证相同的
+// 测量值和判定依据始终对应相同的单项结论，两处不再各自维护比较逻辑。
+func itemExceeded(value, limit float64) bool { return value > limit }
+
+// overallExceeded 是“整份样品是否超标”的唯一汇总规则：多项目样品只要任一
+// 单项超标整份就超标，全部单项达标才算整份达标；任何一项达标都不能覆盖另一
+// 项的超标。入参按原测量顺序排列，汇总结果与排列无关。确认新样品与打开已有
+// 数据时核对整份标记共用这一规则。
+func overallExceeded(itemFlags []bool) bool {
+	for _, exceeded := range itemFlags {
+		if exceeded {
+			return true
+		}
+	}
+	return false
 }
 
 // cmpText 生成比较词，仅用于损坏记录的错误信息。
@@ -980,23 +1000,32 @@ func (s *Store) Confirm(id string) (Sample, error) {
 		return copySample(smp), nil
 	}
 
-	results := make([]ItemResult, 0, len(smp.Measurements))
-	exceeded := false
+	// 先为每个项目找齐采样当时已生效的最近一版上限：任一项目缺少适用上限都
+	// 整次拒绝，不产生部分结果。找齐后与打开已有记录时的核对共用同一套比较
+	// 与汇总规则（itemExceeded / overallExceeded），保证相同的测量值和判定
+	// 依据在两个场景下始终得到相同结论。
+	chosen := make([]Limit, 0, len(smp.Measurements))
+	itemFlags := make([]bool, 0, len(smp.Measurements))
 	for _, m := range smp.Measurements {
 		lim, ok := applicableLimit(s.limits[limitGroup{pointID: smp.PointID, item: m.Item}], smp.SampledAt)
 		if !ok {
 			return Sample{}, fmt.Errorf("%w: 样品 %s 的项目 %s", ErrMissingLimit, id, m.Item)
 		}
-		ex := m.Value > lim.Value
-		if ex {
-			exceeded = true
-		}
+		chosen = append(chosen, lim)
+		itemFlags = append(itemFlags, itemExceeded(m.Value, lim.Value))
+	}
+	exceeded := overallExceeded(itemFlags)
+
+	// 逐项结果按原测量顺序返回，顺序与测量列表一致。
+	results := make([]ItemResult, 0, len(smp.Measurements))
+	for i, m := range smp.Measurements {
+		lim := chosen[i]
 		results = append(results, ItemResult{
 			Item:           m.Item,
 			Value:          m.Value,
 			Limit:          lim.Value,
 			LimitEffective: lim.Effective,
-			Exceeded:       ex,
+			Exceeded:       itemFlags[i],
 		})
 	}
 	smp.Results = results

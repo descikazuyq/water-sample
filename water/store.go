@@ -1,6 +1,7 @@
 package water
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,7 +45,7 @@ var (
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
 	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
-	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少状态或状态值不受支持、缺少采样时间、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，或缺少上限数值、缺少生效时间的损坏限值记录")
+	ErrCorruptRecord      = errors.New("water: 本地数据中存在样品集合编号重复、缺少状态或状态值不受支持、缺少采样时间、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，或缺少上限数值、缺少生效时间的损坏限值记录")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -88,11 +89,22 @@ type Sample struct {
 	VoidReason   string        `json:"voidReason,omitempty"`
 }
 
-// diskState 是落盘的完整数据。
+// diskState 是落盘的完整数据，写出数据文件时使用。
 type diskState struct {
 	Points  map[string]SamplingPoint `json:"points"`
 	Limits  map[string][]Limit       `json:"limits"` // 键仅为落盘占位，读取时按每条限值自身的采样点与项目重新分组
 	Samples map[string]*Sample       `json:"samples"`
+}
+
+// loadedState 是读入数据文件时使用的结构。Samples 保留每份样品记录的原始
+// JSON：直接解进 map[string]*Sample 时，JSON 同名键会被后一条记录静默覆盖，
+// 样品集合里的重复编号在 map 中根本看不出来。因此读取先解成本结构，在逐条
+// 解码样品之前扫描原始 JSON 核对编号唯一，确认没有重复后再解成
+// map[string]*Sample；写出仍使用 diskState。
+type loadedState struct {
+	Points  map[string]SamplingPoint   `json:"points"`
+	Limits  map[string][]Limit         `json:"limits"`
+	Samples map[string]json.RawMessage `json:"samples"`
 }
 
 // limitGroup 用两个字段各自标识一组限值，避免把包含 U+0000 的文本
@@ -189,6 +201,23 @@ type Store struct {
 // 后来新增或补录的限值而拒绝或重新计算。没有任何样品的新数据目录，以及样品
 // 集合为空的已有数据，都照常打开。
 //
+// 样品集合本身还要满足编号唯一：samples 中同一个样品编号只能出现一次。文件
+// 可能被外部改动或由旧版本写入：同一编号写了两条样品记录时，JSON 解码成
+// 映射表会用后一条静默覆盖前一条，原本已确认的超标结论可能被另一条达标结论
+// 顶替，而映射表中只剩一条，逐份样品的完整性检查根本发现不了被覆盖的记录。
+// 因此读取先扫描样品集合的原始 JSON（在逐条解码、逐份校验之前）核对编号：
+// 编号按 JSON 解码后的完整文本判断，一处直接写出 "S1"、另一处把字符写成
+// Unicode 转义（如 "S\u0031"）仍是同一个编号；重复条目是否相邻、
+// 中间是否隔着其他样品都不影响识别；即使两条记录的内容完全相同也算重复，
+// 不按排列顺序选出其中一条作为“最近有效结果”。这条要求适用于待判定、已确认
+// 和已作废的全部样品，不以是否已有判定结果为条件。发现重复编号即整次打开
+// 失败，以可被 errors.Is(err, ErrCorruptRecord) 识别的错误返回，数据存放为
+// nil；错误信息指出重复的样品编号，并明确说明是样品集合中存在重复编号，使
+// 调用方能把它与同一份样品内部测量项目重复的问题区分开。不删除条目、不合并
+// 内容、不择一保留、不补出判定或重算历史结论，文件里其他样品再正常也不部分
+// 读入，拒绝只发生在打开阶段且不回写原文件。不同样品都包含 pH、或各自包含
+// 相同字段名，是正常数据，与样品集合的键无关，不会被误判成样品编号重复。
+//
 // 限值版本同样在打开时核对：同一采样点、同一项目（归属只看每条记录自身的
 // pointId 与 item，不看落盘键，含 U+0000 的不同组合即使共用旧版存储键也各自
 // 成组）下只要存在两条生效时刻相同的上限，整次打开即以可被
@@ -249,7 +278,7 @@ func Open(dir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	var st diskState
+	var st loadedState
 	if err := json.Unmarshal(data, &st); err != nil {
 		return nil, fmt.Errorf("water: 读取数据文件失败: %w", err)
 	}
@@ -335,6 +364,21 @@ func Open(dir string) (*Store, error) {
 		}
 	}
 	if st.Samples != nil {
+		// 样品集合中的编号在文件里只能出现一次。直接解进 map[string]*Sample
+		// 时，JSON 同名键会被后一条记录静默覆盖：先保存的已确认超标结论可能
+		// 被后一条达标结论顶替，而 map 中只剩一条，现有逐份校验根本发现不了
+		// 被覆盖的记录。因此在逐条解码样品之前，先扫描样品集合的原始 JSON，
+		// 按 JSON 解码后的完整编号文本核对唯一（一处直接写 "S1"、另一处写成
+		// "S\u0031" 仍是同一编号；条目之间隔着其他样品也一样）。发现重复立即整次
+		// 失败：不择一保留、不合并内容、不跳过其余正常样品只读入一部分，也不
+		// 回写原文件。
+		if dupID, ok, err := findDuplicateSampleID(data); err != nil {
+			return nil, fmt.Errorf("water: 读取数据文件失败: %w", err)
+		} else if ok {
+			return nil, fmt.Errorf("%w: 本地样品集合中存在重复编号 %s：samples 中的样品编号只能出现一次，与同一份样品内部测量项目重复无关",
+				ErrCorruptRecord, dupID)
+		}
+		// 编号唯一后再逐条解码（此时 map 键与文件中的样品条目一一对应），
 		// 逐份校验后才整体接收：每份样品都必须明确写有三种状态之一（缺失、
 		// null、空字符串或其他字符串都是损坏），任何状态的样品都必须保留采样
 		// 时间（字段缺失、null 或零时间都是损坏），必须至少保留
@@ -345,17 +389,23 @@ func Open(dir string) (*Store, error) {
 		// 样品不通过，整次
 		// 打开都失败，不返回数据存放对象，也不静默跳过、择一保留、补测量、
 		// 补测量值、补判定、补上限或回写原文件。
+		samples := make(map[string]*Sample, len(st.Samples))
 		ids := make([]string, 0, len(st.Samples))
 		for id := range st.Samples {
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
 		for _, id := range ids {
-			if err := validateLoadedSample(id, st.Samples[id], missing); err != nil {
+			var smp *Sample
+			if err := json.Unmarshal(st.Samples[id], &smp); err != nil {
+				return nil, fmt.Errorf("water: 读取数据文件失败: %w", err)
+			}
+			if err := validateLoadedSample(id, smp, missing); err != nil {
 				return nil, err
 			}
+			samples[id] = smp
 		}
-		s.samples = st.Samples
+		s.samples = samples
 	}
 	return s, nil
 }
@@ -447,6 +497,82 @@ func probeMissingFields(data []byte) (missingFields, error) {
 		}
 	}
 	return missing, nil
+}
+
+// findDuplicateSampleID 扫描数据文件中 samples 对象的原始 JSON，返回第一个
+// （按文件中出现顺序）重复出现的样品编号。样品集合里同一编号只能出现一次：
+// 直接解进 map 时 JSON 同名键会被后一条静默覆盖，重复编号在 map 中看不出来，
+// 因此必须在解码成 map 之前按原始条目核对。键文本按 JSON 解码后的完整文本
+// 判断：一处直接写 "S1"、另一处把字符写成 Unicode 转义（如 "S\u0031"）仍是
+// 同一编号；条目之间隔着其他样品也一样。samples 字段缺失或为 null 时不算
+// 重复（返回 ok=false，空集合照常打开）。不同样品各自包含同名测量项目与
+// samples 对象的键无关，不会在这里被误判。
+func findDuplicateSampleID(data []byte) (dup string, ok bool, err error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	found, err := findTopLevelObjectField(dec, "samples")
+	if err != nil {
+		return "", false, err
+	}
+	if !found {
+		return "", false, nil
+	}
+	tok, err := dec.Token()
+	if err != nil {
+		return "", false, err
+	}
+	// samples 不是对象（null、数组或标量）时这里不报重复：null 是空集合，
+	// 其他类型会在随后正常反序列化时按“读取数据文件失败”处理。走到这里时
+	// 顶层反序列化已经成功，正常情况下 tok 一定是样品集合对象的左花括号。
+	delim, isDelim := tok.(json.Delim)
+	if !isDelim || delim != '{' {
+		return "", false, nil
+	}
+	seen := make(map[string]bool)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return "", false, err
+		}
+		id := keyTok.(string) // 对象键一定是字符串
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return "", false, err
+		}
+		if seen[id] {
+			return id, true, nil
+		}
+		seen[id] = true
+	}
+	return "", false, nil
+}
+
+// findTopLevelObjectField 在顶层 JSON 对象中推进到名为 field 的字段值开始处：
+// 返回 found=true 时 Decoder 正停在该字段值的第一个 token 前（调用方可用
+// Token/Decode 读取值）；返回 found=false 表示顶层对象中没有这个字段。
+// field 之外的字段整值跳过、不随其内部层级深入，因此样品内部的字段不会被
+// 误当成样品集合的键。
+func findTopLevelObjectField(dec *json.Decoder, field string) (bool, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return false, err
+	}
+	if d, isDelim := tok.(json.Delim); !isDelim || d != '{' {
+		return false, fmt.Errorf("water: 数据文件顶层应为 JSON 对象")
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return false, err
+		}
+		if keyTok.(string) == field {
+			return true, nil
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 // validateLoadedSample 校验一份从本地文件读入的样品记录。

@@ -190,20 +190,31 @@ type Store struct {
 // 后来新增或补录的限值而拒绝或重新计算。没有任何样品的新数据目录，以及样品
 // 集合为空的已有数据，都照常打开。
 //
-// 在逐份校验之前还要先核对样品集合本身：每个样品编号在 samples 集合中只能出现
-// 一次。JSON 反序列化进 map 时同键的后一条记录会静默覆盖前一条，若不在读取时
-// 单独核对，原本已确认的超标结论可能被另一条同编号的达标结论替换，而所有逐份
-// 完整性检查都只能看到幸存条目、发现不了被覆盖的记录。编号是否相同按 JSON
-// 解码后的完整文本判断：同一个 S1 一处直接写出、另一处把 S 写成 Unicode 转义，
-// 仍然是同一编号；重复条目之间隔着其他样品也一样，不依赖两条是否相邻。即使
-// 两条记录内容完全相同也按重复编号拒绝，不按排列顺序选出其中一条作为“最近”
-// 结果；这条要求适用于待判定、已确认和已作废的全部样品，不以是否已有判定结果
-// 为条件。发现重复编号时整次打开以可被 errors.Is(err, ErrCorruptRecord)
+// 在逐份校验之前还要先核对样品集合本身：每个样品编号在整份文件的样品集合中
+// 只能出现一次。JSON 反序列化进 map 时同键的后一条记录会静默覆盖前一条，若不在
+// 读取时单独核对，原本已确认的超标结论可能被另一条同编号的达标结论替换，而所有
+// 逐份完整性检查都只能看到幸存条目、发现不了被覆盖的记录。唯一性核对覆盖整份
+// 文件中所有会被当作样品集合读取的顶层条目：若文件顶层重复写出多个 samples
+// 对象，反序列化会把它们合并进同一个 map，分散在不同对象里的同一编号无论两处
+// 之间是否隔着其他样品或顶层字段都算重复，不能每个对象各查各的漏掉它；Samples、
+// SAMPLES 等大小写写法（包括把字段名中的字母写成 Unicode 转义、解码后仍是
+// samples 的写法）都会被读取识别为同一个样品集合字段，纳入同一次编号核对，
+// 不能借换大小写绕过；集合后再出现空对象或 null 时反序列化结果可能为空，核对
+// 仍按文件原始标记无条件执行，前面已经出现的重复编号不会因后面的空集合或 null
+// 逃过检查。编号是否相同按 JSON 解码后的完整文本判断：同一个 S1 一处直接写出、
+// 另一处把 S 写成 Unicode 转义，仍然是同一编号；重复条目之间隔着其他样品也
+// 一样，不依赖两条是否相邻。即使两条记录内容完全相同也按重复编号拒绝，不按
+// 排列顺序选出其中一条作为“最近”结果；这条要求适用于待判定、已确认和已作废的
+// 全部样品，不以是否已有判定结果为条件。多个非空样品集合没有重复编号、其余
+// 内容合法时继续照常读入，不因集合字段出现多次就一概拒绝；样品集合为空或
+// 缺失仍可打开。发现重复编号时整次打开以可被 errors.Is(err, ErrCorruptRecord)
 // 识别的错误失败，返回 nil 数据存放，错误信息指出重复的样品编号并说明样品集合
 // 中存在重复编号，使调用方能把它与同一份样品内部测量项目重复的问题区分开；
 // 同一文件里其他样品再正常也不只读入正常部分，不删除条目、不合并内容、不择一
 // 保留、不补出判定、不重算历史结论，也不回写原文件。不同样品都包含同一测量
-// 项目（如各自都有 pH）或同名字段是正常数据，不属于样品编号重复。
+// 项目（如各自都有 pH）或同名字段是正常数据，不属于样品编号重复；points、
+// limits 等其他顶层字段里的同名键，以及单份样品记录内部的字段，都不能被当作
+// 集合条目统计。
 //
 // 限值版本同样在打开时核对：同一采样点、同一项目（归属只看每条记录自身的
 // pointId 与 item，不看落盘键，含 U+0000 的不同组合即使共用旧版存储键也各自
@@ -269,21 +280,22 @@ func Open(dir string) (*Store, error) {
 	if err := json.Unmarshal(data, &st); err != nil {
 		return nil, fmt.Errorf("water: 读取数据文件失败: %w", err)
 	}
-	if st.Samples != nil {
-		// 样品集合这一层先于任何逐份校验：JSON 反序列化进 map 时，同键的后一条
-		// 记录会悄悄覆盖前一条，已确认的超标结论可能被另一条达标结论替换，而
-		// 逐份完整性校验只能看到幸存下来的条目。按文件中的原始 JSON 标记核对
-		// 样品集合的键，每个样品编号只能出现一次；发现重复时整次打开失败，
-		// 不返回数据存放对象，不删除、不合并、不择一、不补判定、不重算历史
-		// 结论，也不回写原文件。
-		dupID, err := duplicateSampleID(data)
-		if err != nil {
-			return nil, fmt.Errorf("water: 读取数据文件失败: %w", err)
-		}
-		if dupID != "" {
-			return nil, fmt.Errorf("%w: 样品集合中存在重复的样品编号 %s：样品编号在本地样品集合中只能出现一次；这是样品集合内编号重复，不同于同一份样品内部的测量项目重复",
-				ErrCorruptRecord, dupID)
-		}
+	// 样品集合这一层先于任何逐份校验，且不以反序列化后的 st.Samples 是否为 nil
+	// 为前提：JSON 反序列化进 map 时同键的后一条记录会悄悄覆盖前一条，已确认的
+	// 超标结论可能被另一条达标结论替换；若顶层重复写出多个 samples 对象，
+	// encoding/json 会把它们合并进同一个 map（同键后写覆盖先写），Samples、
+	// SAMPLES 等大小写写法也填同一个字段，而后面再出现的 null 还会把整个 map
+	// 置空、空对象也可能让前面的内容看似消失。所以必须直接按文件原始 JSON 标记，
+	// 跨整份文件中所有会被当作样品集合读取的顶层字段统一核对编号，每个样品编号
+	// 只能出现一次；发现重复时整次打开失败，不返回数据存放对象，不删除、不合并、
+	// 不择一、不补判定、不重算历史结论，也不回写原文件。
+	dupID, err := duplicateSampleID(data)
+	if err != nil {
+		return nil, fmt.Errorf("water: 读取数据文件失败: %w", err)
+	}
+	if dupID != "" {
+		return nil, fmt.Errorf("%w: 样品集合中存在重复的样品编号 %s：样品编号在本地样品集合中只能出现一次；这是样品集合内编号重复，不同于同一份样品内部的测量项目重复",
+			ErrCorruptRecord, dupID)
 	}
 	if st.Points != nil {
 		s.points = st.Points
@@ -392,16 +404,42 @@ func Open(dir string) (*Store, error) {
 	return s, nil
 }
 
-// duplicateSampleID 按文件中的原始 JSON 标记核对顶层 samples 对象，返回第一个
-// （按文件中的出现顺序）出现两次的样品编号；没有重复或 samples 不是对象时返回
-// 空串。
+// samplesFieldName 是顶层样品集合字段在 JSON 中的规范名称；读取时用
+// strings.EqualFold 识别，与 encoding/json 的 foldName 判定保持一致——两者都
+// 建立在 unicode.SimpleFold 的逐字符折叠等价关系上（encoding/json 解码结构体
+// 字段时按 foldName(键) 是否等于折叠后的标签匹配，标签 samples 全是 ASCII）。
+// 因此 samples、Samples、SAMPLES，乃至 "ſamples"（长 s，U+017F，会折叠成 s）
+// 以及把字符写成 Unicode 转义、解码后仍是同一文本的写法，都会被读取当成同一
+// 个样品集合字段并纳入同一次编号核对；sample、x-samples 等折叠后不等价的字段
+// 名不在此列。这样核对范围与 json 实际读进 Samples 字段的键严格一致：既不会
+// 借换大小写（或其他同折叠集字符）绕过，也不会把 json 本会忽略的未知字段误判
+// 成样品集合。
+const samplesFieldName = "samples"
+
+// duplicateSampleID 按文件中的原始 JSON 标记核对整份文件中的样品集合，返回
+// 第一个（按文件中的出现顺序）出现两次的样品编号；没有重复或根本不存在样品
+// 集合时返回空串。
 //
 // 这一层必须单独核对：json.Unmarshal 反序列化进 map 时，同键的后一条记录会
 // 静默覆盖前一条，逐份完整性校验只能看到幸存下来的条目，原本已确认的超标结论
-// 可能被另一条同编号的达标结论替换而不被发现。编号是否相同按 JSON 解码后的
-// 完整文本判断：一处直接写出 "S1"、另一处写成 "S1" 仍是同一个编号；
-// 重复条目之间隔着其他样品也一样。样品记录内部的重名键不属于样品集合这一层
-// （它们由逐份校验负责），因此逐条跳过记录值，只统计 samples 对象直属的键。
+// 可能被另一条同编号的达标结论替换而不被发现。编号唯一性覆盖整份文件中所有
+// 会被当作样品集合读取的顶层条目：
+//
+//   - 顶层重复写出的多个 samples 对象会被 encoding/json 合并进同一个 map，
+//     分散在不同对象里的同一编号（无论两处之间是否隔着其他样品或顶层字段）
+//     必须共用同一份“已见编号”核对，不能每个对象各查各的；
+//   - Samples、SAMPLES 等大小写写法，以及字段名把字母写成 Unicode 转义
+//     （"samples" 解码后仍是 samples）的写法，都会被读取识别为同一个
+//     字段，纳入同一次核对，不能借换大小写绕过；
+//   - 同一编号一处直接写出、另一处把编号中的字符写成 Unicode 转义，按 JSON
+//     解码后的完整文本判断仍是同一编号；
+//   - 即使集合后又出现空对象或 null（反序列化后 st.Samples 可能为 nil 或为空
+//     map），已经出现过的重复编号也不能逃过检查，因此本核对由 Open 无条件调用，
+//     不以反序列化结果非空为前提。
+//
+// 样品记录内部的重名键不属于样品集合这一层（它们由逐份校验负责），因此逐条
+// 跳过记录值，只统计样品集合对象直属的键；points、limits 等其他顶层字段中的
+// 同名键同样不计入。
 func duplicateSampleID(data []byte) (string, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	tok, err := dec.Token()
@@ -411,21 +449,22 @@ func duplicateSampleID(data []byte) (string, error) {
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
 		return "", nil
 	}
-	// 顶层 samples 正常只会出现一次；即使文件被改成重复写出多个 samples
-	// 属性，也逐个都核对，不依赖反序列化最终保留了哪一个。
+	// 整份文件共用同一份已见编号：无论顶层出现多少个样品集合字段、用什么大小
+	// 写写法或是否夹着其他顶层字段，编号都只允许出现一次。
+	seen := map[string]struct{}{}
 	for dec.More() {
 		kt, err := dec.Token()
 		if err != nil {
 			return "", err
 		}
 		key, _ := kt.(string)
-		if key != "samples" {
+		if !strings.EqualFold(key, samplesFieldName) {
 			if err := skipJSONValue(dec); err != nil {
 				return "", err
 			}
 			continue
 		}
-		dup, err := firstDuplicateKeyInObject(dec)
+		dup, err := firstDuplicateKeyInObject(dec, seen)
 		if err != nil || dup != "" {
 			return dup, err
 		}
@@ -434,23 +473,24 @@ func duplicateSampleID(data []byte) (string, error) {
 	return "", err
 }
 
-// firstDuplicateKeyInObject 消费 dec 上紧邻的一个 JSON 对象，按标记出现顺序
-// 返回其中第一个重复键；紧邻的值不是对象（标量、null 或数组）时按无重复处理，
-// 并把该值完整消费掉。
-func firstDuplicateKeyInObject(dec *json.Decoder) (string, error) {
+// firstDuplicateKeyInObject 消费 dec 上紧邻的一个样品集合对象，按标记出现顺序
+// 把其中的键与外层传入的已见编号集合 seen 一起核对，并返回第一个重复键；紧邻
+// 的值不是对象（标量、null 或数组）时按无重复处理，并把该值完整消费掉。
+// seen 跨顶层多个样品集合对象共用：编号在本对象内第二次出现，或在前面某个
+// 集合中已经出现过，都算重复。
+func firstDuplicateKeyInObject(dec *json.Decoder, seen map[string]struct{}) (string, error) {
 	tok, err := dec.Token()
 	if err != nil {
 		return "", err
 	}
 	d, ok := tok.(json.Delim)
 	if !ok {
-		return "", nil // 标量或 null，单个标记即完整值
+		return "", nil // 标量或 null（含 samples:null），单个标记即完整值
 	}
 	if d != '{' {
 		// 数组等非对象值：排空到与起始定界符配平为止。
 		return "", drainBalanced(dec)
 	}
-	seen := map[string]struct{}{}
 	for dec.More() {
 		kt, err := dec.Token()
 		if err != nil {

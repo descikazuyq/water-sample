@@ -162,6 +162,19 @@ type Store struct {
 // 完整记录原样读入，已保存的上限、生效时间、逐项结论与整份超标标记保留，不因
 // 后来新增或补录的限值而拒绝或重新计算。没有任何样品的新数据目录，以及样品
 // 集合为空的已有数据，都照常打开。
+//
+// 限值版本同样在打开时核对：同一采样点、同一项目（归属只看每条记录自身的
+// pointId 与 item，不看落盘键，含 U+0000 的不同组合即使共用旧版存储键也各自
+// 成组）下只要存在两条生效时刻相同的上限，整次打开即以可被
+// errors.Is(err, ErrDuplicateLimitTime) 识别的错误失败，返回 nil 数据存放，
+// 错误信息点到具体采样点、项目与重复的生效时间。即使两条数值完全相同也算
+// 重复：不合并、不择一保留、不跳过问题组只读入其余部分，文件里其他采样点与
+// 样品再正常也不部分读入，更不回写原文件或把拒绝推迟到确认某份样品时。
+// 生效时刻按真实时刻判断：不同时区偏移但表示同一瞬间的日期仍算重复，相差一
+// 纳秒的两版是合法的不同版本，不按秒截断。不同采样点或不同项目在同一时刻
+// 各登记一版仍合法。没有重复的多版本数据可乱序保存后正常打开，确认时继续
+// 采用采样当时已生效的最近一版，恰好等于生效时刻采用新版；已确认或已作废
+// 样品保存的历史判定依据原样保留，不因读取检查重算。
 func Open(dir string) (*Store, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, fmt.Errorf("%w: 数据目录", ErrEmptyField)
@@ -200,9 +213,33 @@ func Open(dir string) (*Store, error) {
 				s.limits[g] = append(s.limits[g], lim)
 			}
 		}
-		for g, versions := range s.limits {
+		// 按确定性顺序逐组排序并核对：同一生效时刻在同一（采样点，项目）组内
+		// 只能有一版，与 SetLimit 登记时的拒绝规则一致——文件里已经存在的重复
+		// 版本也必须在打开时整次拒绝，不能读入后让确认时“选到哪一版”取决于
+		// 记录排列。分组键序排序只为让重复时报告的组稳定；时间按真实时刻比较
+		// （time.Equal 忽略时区写法、保留纳秒精度）：不同时区表示同一瞬间仍算
+		// 重复，相差一纳秒则是两版。任一组重复都返回 nil 存放，不合并、不择一、
+		// 不跳过该组或其他正常采样点与样品，也不回写原文件。
+		groups := make([]limitGroup, 0, len(s.limits))
+		for g := range s.limits {
+			groups = append(groups, g)
+		}
+		sort.Slice(groups, func(i, j int) bool {
+			if groups[i].pointID != groups[j].pointID {
+				return groups[i].pointID < groups[j].pointID
+			}
+			return groups[i].item < groups[j].item
+		})
+		for _, g := range groups {
+			versions := s.limits[g]
 			sort.Slice(versions, func(i, j int) bool { return versions[i].Effective.Before(versions[j].Effective) })
 			s.limits[g] = versions
+			for i := 1; i < len(versions); i++ {
+				if versions[i].Effective.Equal(versions[i-1].Effective) {
+					return nil, fmt.Errorf("%w: %s/%s @ %s",
+						ErrDuplicateLimitTime, g.pointID, g.item, versions[i].Effective.UTC())
+				}
+			}
 		}
 	}
 	if st.Samples != nil {

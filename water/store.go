@@ -159,6 +159,22 @@ type Store struct {
 // 改成另一种状态、也不会把拒绝推迟到请求确认时，更不会改写原文件。待判定
 // 样品没有判定记录、待判定后作废的样品没有历史依据，均属正常，只要原测量
 // 完整就照常读入，不要求它们提前保存判定上限。
+//
+// 读入限值时还要核对生效时刻的唯一性：限值归属由每条记录自身的采样点编号与
+// 项目名共同确定（不按落盘存储键分组，共用一个存储键的不同组合仍各自成组），
+// 同一采样点同一项目下只要存在两条生效时刻相同的上限，整次打开即以可被
+// errors.Is(err, ErrDuplicateLimitTime) 识别的错误失败，返回 nil 数据存放，
+// 错误信息点到具体采样点、项目与重复的生效时间；即使两条数值完全相同也算
+// 重复，不合并、不择一保留、不跳过该组，文件里其他采样点与样品正常也不能
+// 只读入正常部分。生效时刻按真实瞬间比较：不同时区偏移表示同一时刻算重复，
+// 只差一纳秒的两个生效时间是各自合法的不同版本，不按秒截断误报；不同采样点
+// 或不同项目在同一时刻各自登记限值仍合法。重复版本无论保存在同一存储条目里
+// 还是分散在不同条目下都按记录自身的归属识别。拒绝只发生在读取阶段，不改写
+// 原文件，也不把问题推迟到确认某份样品时。
+// 没有重复的多版本限值允许乱序保存后正常打开，读入后仍按生效时间升序排列；
+// 待判定样品确认时继续采用采样当时已生效的最近一版，恰好在生效时刻采用新值。
+// 已确认或已作废样品保存的历史判定依据原样保留，不因读取检查重算；正常登记时
+// SetLimit 拒绝同组同刻第二版的行为保持不变。
 // 完整记录原样读入，已保存的上限、生效时间、逐项结论与整份超标标记保留，不因
 // 后来新增或补录的限值而拒绝或重新计算。没有任何样品的新数据目录，以及样品
 // 集合为空的已有数据，都照常打开。
@@ -193,16 +209,43 @@ func Open(dir string) (*Store, error) {
 	if st.Limits != nil {
 		// 不按落盘键分组：键可能是旧版本用单字符拼接生成的，包含 U+0000 的
 		// 不同（采样点，项目）组合会共用同一个键。以每条限值自身的两个字段为准，
-		// 让曾经被错误合并的组在重新打开时也能各自归位。
+		// 让曾经被错误合并的组在重新打开时也能各自归位；同一组即使被分散在
+		// 不同落盘条目下，也会在这里汇到一起。
 		for _, versions := range st.Limits {
 			for _, lim := range versions {
 				g := limitGroup{pointID: lim.PointID, item: lim.Item}
 				s.limits[g] = append(s.limits[g], lim)
 			}
 		}
-		for g, versions := range s.limits {
-			sort.Slice(versions, func(i, j int) bool { return versions[i].Effective.Before(versions[j].Effective) })
+		// 按（采样点编号，项目名）固定顺序核对，保证同一文件的重复错误信息稳定。
+		groups := make([]limitGroup, 0, len(s.limits))
+		for g := range s.limits {
+			groups = append(groups, g)
+		}
+		sort.Slice(groups, func(i, j int) bool {
+			if groups[i].pointID != groups[j].pointID {
+				return groups[i].pointID < groups[j].pointID
+			}
+			return groups[i].item < groups[j].item
+		})
+		for _, g := range groups {
+			versions := s.limits[g]
+			sort.SliceStable(versions, func(i, j int) bool {
+				return versions[i].Effective.Before(versions[j].Effective)
+			})
 			s.limits[g] = versions
+			// 同一采样点同一项目下，生效时刻相同的两条版本让判定依据不唯一：
+			// 即使两条数值完全相同、即使它们分散在不同落盘条目下，也不能合并、
+			// 择一或跳过，必须让整次打开失败。按真实时刻比较（time.Equal）：
+			// 不同时区偏移表示同一瞬间算重复，差一纳秒则是各自合法的不同版本，
+			// 不按秒截断。不同采样点或不同项目各自成组，同一时刻互不冲突。
+			for i := 1; i < len(versions); i++ {
+				if versions[i].Effective.Equal(versions[i-1].Effective) {
+					return nil, fmt.Errorf("%w: 采样点 %s 的项目 %s 存在两条生效时间相同的上限：%s",
+						ErrDuplicateLimitTime, g.pointID, g.item,
+						versions[i].Effective.UTC().Format(time.RFC3339Nano))
+				}
+			}
 		}
 	}
 	if st.Samples != nil {

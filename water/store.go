@@ -666,25 +666,24 @@ func validateLoadedSample(key string, smp *Sample, missing missingFields) error 
 		}
 	}
 	// 超标标记必须与这份样品已保存的判定依据一致。只按每条记录保存的测量值与
-	// 上限判断：严格大于才超标，小于或等于（含等于、零或负数的合法组合）都为
-	// 达标；不重新选择当前限值。单项标记与依据矛盾时点名该项目，整份标记与
-	// 逐项结论矛盾时单独说明。整份样品只允许一种矛盾先报出，但两者都会拒绝。
-	anyExceeded := false
+	// 上限判断，判定与汇总规则与确认新样品时共用同一组函数：严格大于才超标，
+	// 小于或等于（含等于、零或负数的合法组合）都为达标；任一项超标则整份超标。
+	// 不重新选择当前限值。单项标记与依据矛盾时点名该项目，整份标记与逐项结论
+	// 矛盾时单独说明。整份样品只允许一种矛盾先报出，但两者都会拒绝。
+	itemFlags := make([]bool, 0, len(smp.Results))
 	for _, r := range smp.Results {
-		want := r.Value > r.Limit
+		want := exceededByLimit(r.Value, r.Limit)
 		if r.Exceeded != want {
 			return fmt.Errorf("%w: 样品 %s 的项目 %s 超标标记与保存的判定依据不一致：测量值 %g %s 上限 %g 应判为%s，却保存为%s",
 				ErrCorruptRecord, id, r.Item, r.Value, cmpText(r.Value, r.Limit), r.Limit,
 				judgementText(want), judgementText(r.Exceeded))
 		}
-		if want {
-			anyExceeded = true
-		}
+		itemFlags = append(itemFlags, want)
 	}
-	if smp.Exceeded != anyExceeded {
+	if smp.Exceeded != anyItemExceeded(itemFlags) {
 		return fmt.Errorf("%w: 样品 %s 的整份超标标记与逐项判定结论不一致：逐项判定中%s，整份标记却保存为%s",
 			ErrCorruptRecord, id,
-			overallText(anyExceeded), judgementText(smp.Exceeded))
+			overallText(anyItemExceeded(itemFlags)), judgementText(smp.Exceeded))
 	}
 	return nil
 }
@@ -955,6 +954,23 @@ func sameSampleContent(s *Sample, pointID string, sampledAt time.Time, ms map[st
 	return true
 }
 
+// exceededByLimit 是单项超标的唯一判定规则：测量值严格大于所用上限才超标，
+// 小于或等于（含等于、零与负数的合法组合）均为达标。确认新样品与核对已保存
+// 的判定记录共用这一规则，保证相同的测量值与判定依据始终对应相同的结论。
+func exceededByLimit(value, limit float64) bool { return value > limit }
+
+// anyItemExceeded 是整份超标的唯一汇总规则：任一项目超标则整份样品超标，
+// 全部项目达标才算整份达标。入参是逐项结论（确认时为刚算出的逐项标记，
+// 核对时为按保存依据复算出的逐项应有结论），顺序不影响结果。
+func anyItemExceeded(items []bool) bool {
+	for _, ex := range items {
+		if ex {
+			return true
+		}
+	}
+	return false
+}
+
 // Confirm 确认一份待判定样品：每个项目取生效时间不晚于采样时间的最近一版上限，
 // 测量值大于上限才超标，任一项目超标则整份样品超标。
 // 只要有项目找不到适用上限，本次确认拒绝，样品保持待判定。
@@ -981,16 +997,14 @@ func (s *Store) Confirm(id string) (Sample, error) {
 	}
 
 	results := make([]ItemResult, 0, len(smp.Measurements))
-	exceeded := false
+	itemFlags := make([]bool, 0, len(smp.Measurements))
 	for _, m := range smp.Measurements {
 		lim, ok := applicableLimit(s.limits[limitGroup{pointID: smp.PointID, item: m.Item}], smp.SampledAt)
 		if !ok {
 			return Sample{}, fmt.Errorf("%w: 样品 %s 的项目 %s", ErrMissingLimit, id, m.Item)
 		}
-		ex := m.Value > lim.Value
-		if ex {
-			exceeded = true
-		}
+		ex := exceededByLimit(m.Value, lim.Value)
+		itemFlags = append(itemFlags, ex)
 		results = append(results, ItemResult{
 			Item:           m.Item,
 			Value:          m.Value,
@@ -1000,7 +1014,7 @@ func (s *Store) Confirm(id string) (Sample, error) {
 		})
 	}
 	smp.Results = results
-	smp.Exceeded = exceeded
+	smp.Exceeded = anyItemExceeded(itemFlags)
 	smp.Status = StatusConfirmed
 	if err := s.persistLocked(); err != nil {
 		smp.Results = nil

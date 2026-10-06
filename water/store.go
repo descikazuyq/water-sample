@@ -44,7 +44,7 @@ var (
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
 	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
-	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录")
+	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，或缺少上限数值的损坏限值记录")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -175,6 +175,19 @@ type Store struct {
 // 各登记一版仍合法。没有重复的多版本数据可乱序保存后正常打开，确认时继续
 // 采用采样当时已生效的最近一版，恰好等于生效时刻采用新版；已确认或已作废
 // 样品保存的历史判定依据原样保留，不因读取检查重算。
+//
+// 每一版登记限值还必须在文件中实际保存上限数值：value 字段缺失或保存为
+// null 时，JSON 反序列化会把它落成 float64 零值，与明确保存的零上限无法
+// 区分，只能在读取时按字段是否存在核对。这条核对针对文件中实际存在的每一
+// 版限值，与当前有没有样品、这一版是否已被样品采用无关：同一项目的旧版或
+// 尚未生效的版本缺少数值同样拒绝，不能只检查最新版本；文件尚未录入任何
+// 样品时也一样。任一版缺少数值，整次打开即以可被
+// errors.Is(err, ErrCorruptRecord) 识别的错误失败，返回 nil 数据存放，
+// 错误信息点到该限值自身的采样点编号、项目与生效时间，并明确说明缺少上限
+// 数值；不补成零、不跳过这一版、不借用同项目另一版的数值，不把拒绝推迟到
+// 确认某份样品时，也不回写原文件。明确保存的数值零仍是合法上限，负数和
+// 正数保持现有含义：适用上限确实为零时，测量值为零达标、大于零超标。没有
+// 登记限值的空数据照常打开，后续样品缺少适用上限时仍按原有行为拒绝确认。
 func Open(dir string) (*Store, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, fmt.Errorf("%w: 数据目录", ErrEmptyField)
@@ -202,6 +215,18 @@ func Open(dir string) (*Store, error) {
 	}
 	if st.Points != nil {
 		s.points = st.Points
+	}
+	// JSON 反序列化把数值字段缺失与 null 都落成 float64 零值，与明确保存的零
+	// 无法区分，因此“有没有保存数值”只能在读取时按字段是否存在单独核对：
+	// 登记限值的 value、样品的原测量 value、逐项判定的 value 与 limit 都靠
+	// 这一次重新扫描探出。
+	var missing missingFields
+	if st.Limits != nil || st.Samples != nil {
+		var err error
+		missing, err = probeMissingFields(data)
+		if err != nil {
+			return nil, fmt.Errorf("water: 读取数据文件失败: %w", err)
+		}
 	}
 	if st.Limits != nil {
 		// 不按落盘键分组：键可能是旧版本用单字符拼接生成的，包含 U+0000 的
@@ -234,6 +259,18 @@ func Open(dir string) (*Store, error) {
 			versions := s.limits[g]
 			sort.Slice(versions, func(i, j int) bool { return versions[i].Effective.Before(versions[j].Effective) })
 			s.limits[g] = versions
+			// 每一版限值都必须实际保存了上限数值：value 字段缺失或为 null 时
+			// 读出的零值与明确保存的零上限无法区分，只能按字段是否存在核对。
+			// 这条核对针对文件中实际存在的每一版，与当前有没有样品、这一版
+			// 是否已被样品采用无关：旧版或尚未生效的版本缺少数值同样整次拒绝，
+			// 不能只检查最新版本。不补成零、不跳过这一版、不借用同项目另一版
+			// 的数值，也不把拒绝推迟到确认某份样品时；明确保存的零不在此列。
+			for _, v := range versions {
+				if missing.limitValue[g][limitTimeKey(v.Effective)] {
+					return nil, fmt.Errorf("%w: 采样点 %s 的项目 %s 于 %s 生效的限值缺少上限数值：value 字段缺失或为 null",
+						ErrCorruptRecord, g.pointID, g.item, v.Effective.UTC())
+				}
+			}
 			for i := 1; i < len(versions); i++ {
 				if versions[i].Effective.Equal(versions[i-1].Effective) {
 					return nil, fmt.Errorf("%w: %s/%s @ %s",
@@ -250,10 +287,6 @@ func Open(dir string) (*Store, error) {
 		// 样品不通过，整次
 		// 打开都失败，不返回数据存放对象，也不静默跳过、择一保留、补测量、
 		// 补测量值、补判定、补上限或回写原文件。
-		missing, err := probeMissingFields(data)
-		if err != nil {
-			return nil, fmt.Errorf("water: 读取数据文件失败: %w", err)
-		}
 		ids := make([]string, 0, len(st.Samples))
 		for id := range st.Samples {
 			ids = append(ids, id)
@@ -271,19 +304,34 @@ func Open(dir string) (*Store, error) {
 
 // missingFields 汇总对数据文件逐字段核对的结果：JSON 反序列化把数值字段缺失
 // 与 null 都落成 float64 零值，与明确保存的零无法区分，因此“有没有保存数值”
-// 只能在读取时按字段是否存在单独核对。三个 map 都以落盘样品编号为键，键内是
-// 缺少对应字段的项目名集合；明确写出数值零（以及负数、正数）的不在任何一列。
+// 只能在读取时按字段是否存在单独核对。样品的三个 map 都以落盘样品编号为键，
+// 键内是缺少对应字段的项目名集合；登记限值的 map 以限值自身归属的（采样点，
+// 项目）组为键，键内是缺少 value 字段的生效时刻（统一按 UTC 文本索引，不同
+// 时区写法表示同一时刻归为同一条）。明确写出数值零（以及负数、正数）的不在
+// 任何一列。
 type missingFields struct {
-	measValue   map[string]map[string]bool // 原测量 value 字段缺失或为 null
-	resultValue map[string]map[string]bool // 逐项判定 value 字段缺失或为 null
-	resultLimit map[string]map[string]bool // 逐项判定 limit 字段缺失或为 null
+	measValue   map[string]map[string]bool     // 原测量 value 字段缺失或为 null
+	resultValue map[string]map[string]bool     // 逐项判定 value 字段缺失或为 null
+	resultLimit map[string]map[string]bool     // 逐项判定 limit 字段缺失或为 null
+	limitValue  map[limitGroup]map[string]bool // 登记限值 value 字段缺失或为 null
 }
 
-// probeMissingFields 重新扫描数据文件，找出每份样品中没有实际保存数值的字段：
-// 每个原测量项目的 value、每条逐项判定的 value 与 limit，字段缺失或保存为
-// null 都计入对应的缺失集合。明确写出数值零（以及负数、正数）的字段不在此列。
+// limitTimeKey 把限值生效时刻规范成可比较的文本键：统一到 UTC 后按纳秒精度
+// 格式化，不同时区写法表示同一时刻归为同一条，相差一纳秒仍是两条。
+func limitTimeKey(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+
+// probeMissingFields 重新扫描数据文件，找出没有实际保存数值的字段：
+// 每份样品中每个原测量项目的 value、每条逐项判定的 value 与 limit，以及每一版
+// 登记限值的 value，字段缺失或保存为 null 都计入对应的缺失集合。明确写出数值
+// 零（以及负数、正数）的字段不在此列。
 func probeMissingFields(data []byte) (missingFields, error) {
 	var probe struct {
+		Limits map[string][]struct {
+			PointID   string    `json:"pointId"`
+			Item      string    `json:"item"`
+			Value     *float64  `json:"value"`
+			Effective time.Time `json:"effective"`
+		} `json:"limits"`
 		Samples map[string]struct {
 			Measurements []struct {
 				Item  string   `json:"item"`
@@ -308,6 +356,22 @@ func probeMissingFields(data []byte) (missingFields, error) {
 			(*m)[key] = map[string]bool{}
 		}
 		(*m)[key][item] = true
+	}
+	// 登记限值按每条记录自身的采样点与项目归组（与读取时的重新分组一致），
+	// 组内按生效时刻定位到具体哪一版缺少数值；不看落盘键。
+	for _, versions := range probe.Limits {
+		for _, lim := range versions {
+			if lim.Value == nil {
+				if missing.limitValue == nil {
+					missing.limitValue = map[limitGroup]map[string]bool{}
+				}
+				g := limitGroup{pointID: lim.PointID, item: lim.Item}
+				if missing.limitValue[g] == nil {
+					missing.limitValue[g] = map[string]bool{}
+				}
+				missing.limitValue[g][limitTimeKey(lim.Effective)] = true
+			}
+		}
 	}
 	for key, smp := range probe.Samples {
 		for _, m := range smp.Measurements {

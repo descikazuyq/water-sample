@@ -1,6 +1,7 @@
 package water
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,7 +45,7 @@ var (
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
 	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
-	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少状态或状态值不受支持、缺少采样时间、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，或缺少上限数值、缺少生效时间的损坏限值记录")
+	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少状态或状态值不受支持、缺少采样时间、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，样品集合中样品编号重复的损坏数据，或缺少上限数值、缺少生效时间的损坏限值记录")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -189,6 +190,21 @@ type Store struct {
 // 后来新增或补录的限值而拒绝或重新计算。没有任何样品的新数据目录，以及样品
 // 集合为空的已有数据，都照常打开。
 //
+// 在逐份校验之前还要先核对样品集合本身：每个样品编号在 samples 集合中只能出现
+// 一次。JSON 反序列化进 map 时同键的后一条记录会静默覆盖前一条，若不在读取时
+// 单独核对，原本已确认的超标结论可能被另一条同编号的达标结论替换，而所有逐份
+// 完整性检查都只能看到幸存条目、发现不了被覆盖的记录。编号是否相同按 JSON
+// 解码后的完整文本判断：同一个 S1 一处直接写出、另一处把 S 写成 Unicode 转义，
+// 仍然是同一编号；重复条目之间隔着其他样品也一样，不依赖两条是否相邻。即使
+// 两条记录内容完全相同也按重复编号拒绝，不按排列顺序选出其中一条作为“最近”
+// 结果；这条要求适用于待判定、已确认和已作废的全部样品，不以是否已有判定结果
+// 为条件。发现重复编号时整次打开以可被 errors.Is(err, ErrCorruptRecord)
+// 识别的错误失败，返回 nil 数据存放，错误信息指出重复的样品编号并说明样品集合
+// 中存在重复编号，使调用方能把它与同一份样品内部测量项目重复的问题区分开；
+// 同一文件里其他样品再正常也不只读入正常部分，不删除条目、不合并内容、不择一
+// 保留、不补出判定、不重算历史结论，也不回写原文件。不同样品都包含同一测量
+// 项目（如各自都有 pH）或同名字段是正常数据，不属于样品编号重复。
+//
 // 限值版本同样在打开时核对：同一采样点、同一项目（归属只看每条记录自身的
 // pointId 与 item，不看落盘键，含 U+0000 的不同组合即使共用旧版存储键也各自
 // 成组）下只要存在两条生效时刻相同的上限，整次打开即以可被
@@ -252,6 +268,22 @@ func Open(dir string) (*Store, error) {
 	var st diskState
 	if err := json.Unmarshal(data, &st); err != nil {
 		return nil, fmt.Errorf("water: 读取数据文件失败: %w", err)
+	}
+	if st.Samples != nil {
+		// 样品集合这一层先于任何逐份校验：JSON 反序列化进 map 时，同键的后一条
+		// 记录会悄悄覆盖前一条，已确认的超标结论可能被另一条达标结论替换，而
+		// 逐份完整性校验只能看到幸存下来的条目。按文件中的原始 JSON 标记核对
+		// 样品集合的键，每个样品编号只能出现一次；发现重复时整次打开失败，
+		// 不返回数据存放对象，不删除、不合并、不择一、不补判定、不重算历史
+		// 结论，也不回写原文件。
+		dupID, err := duplicateSampleID(data)
+		if err != nil {
+			return nil, fmt.Errorf("water: 读取数据文件失败: %w", err)
+		}
+		if dupID != "" {
+			return nil, fmt.Errorf("%w: 样品集合中存在重复的样品编号 %s：样品编号在本地样品集合中只能出现一次；这是样品集合内编号重复，不同于同一份样品内部的测量项目重复",
+				ErrCorruptRecord, dupID)
+		}
 	}
 	if st.Points != nil {
 		s.points = st.Points
@@ -358,6 +390,116 @@ func Open(dir string) (*Store, error) {
 		s.samples = st.Samples
 	}
 	return s, nil
+}
+
+// duplicateSampleID 按文件中的原始 JSON 标记核对顶层 samples 对象，返回第一个
+// （按文件中的出现顺序）出现两次的样品编号；没有重复或 samples 不是对象时返回
+// 空串。
+//
+// 这一层必须单独核对：json.Unmarshal 反序列化进 map 时，同键的后一条记录会
+// 静默覆盖前一条，逐份完整性校验只能看到幸存下来的条目，原本已确认的超标结论
+// 可能被另一条同编号的达标结论替换而不被发现。编号是否相同按 JSON 解码后的
+// 完整文本判断：一处直接写出 "S1"、另一处写成 "S1" 仍是同一个编号；
+// 重复条目之间隔着其他样品也一样。样品记录内部的重名键不属于样品集合这一层
+// （它们由逐份校验负责），因此逐条跳过记录值，只统计 samples 对象直属的键。
+func duplicateSampleID(data []byte) (string, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return "", err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return "", nil
+	}
+	// 顶层 samples 正常只会出现一次；即使文件被改成重复写出多个 samples
+	// 属性，也逐个都核对，不依赖反序列化最终保留了哪一个。
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return "", err
+		}
+		key, _ := kt.(string)
+		if key != "samples" {
+			if err := skipJSONValue(dec); err != nil {
+				return "", err
+			}
+			continue
+		}
+		dup, err := firstDuplicateKeyInObject(dec)
+		if err != nil || dup != "" {
+			return dup, err
+		}
+	}
+	_, err = dec.Token() // 顶层对象结束
+	return "", err
+}
+
+// firstDuplicateKeyInObject 消费 dec 上紧邻的一个 JSON 对象，按标记出现顺序
+// 返回其中第一个重复键；紧邻的值不是对象（标量、null 或数组）时按无重复处理，
+// 并把该值完整消费掉。
+func firstDuplicateKeyInObject(dec *json.Decoder) (string, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return "", err
+	}
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return "", nil // 标量或 null，单个标记即完整值
+	}
+	if d != '{' {
+		// 数组等非对象值：排空到与起始定界符配平为止。
+		return "", drainBalanced(dec)
+	}
+	seen := map[string]struct{}{}
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return "", err
+		}
+		key, _ := kt.(string)
+		// 跳过这条样品记录本身：记录内部各字段即使重名，也不是样品集合层的
+		// 编号重复（那是同一份样品记录的内容问题，由逐份校验负责）。
+		if err := skipJSONValue(dec); err != nil {
+			return "", err
+		}
+		if _, dup := seen[key]; dup {
+			return key, nil
+		}
+		seen[key] = struct{}{}
+	}
+	_, err = dec.Token() // 对象结束 '}'
+	return "", err
+}
+
+// drainBalanced 消费到与已读出的起始 '{'/'[' 配平为止（起始定界符不计入深度）。
+func drainBalanced(dec *json.Decoder) error {
+	depth := 1
+	for depth > 0 {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := t.(json.Delim); ok {
+			if d == '{' || d == '[' {
+				depth++
+			} else {
+				depth--
+			}
+		}
+	}
+	return nil
+}
+
+// skipJSONValue 消费 dec 上紧邻的一个 JSON 值（标量或任意深度的对象、数组）。
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if _, ok := tok.(json.Delim); !ok {
+		return nil // 标量值，单个标记即完整值
+	}
+	return drainBalanced(dec)
 }
 
 // missingFields 汇总对数据文件逐字段核对的结果：JSON 反序列化把数值字段缺失

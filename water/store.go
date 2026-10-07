@@ -45,7 +45,7 @@ var (
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
 	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
-	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少状态或状态值不受支持、缺少采样时间、缺少采样点编号、采样点编号含首尾空白或采样点未登记、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，样品记录缺少编号、编号含首尾空白或集合编号与记录自身编号不一致的损坏样品记录，样品集合中样品编号重复的损坏数据，或缺少采样点编号、采样点编号含首尾空白或采样点未登记、缺少上限数值、缺少生效时间的损坏限值记录")
+	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少状态或状态值不受支持、缺少采样时间、缺少采样点编号、采样点编号含首尾空白或采样点未登记、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、已确认样品或保留逐项判定的作废样品缺少整份超标标记或逐项超标标记（字段缺失或为 null）、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，样品记录缺少编号、编号含首尾空白或集合编号与记录自身编号不一致的损坏样品记录，样品集合中样品编号重复的损坏数据，或缺少采样点编号、采样点编号含首尾空白或采样点未登记、缺少上限数值、缺少生效时间的损坏限值记录")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -170,7 +170,17 @@ type Store struct {
 // 上限放行；生效时间晚于采样时间（按真实时刻比较，保留纳秒精度，恰好相等可以
 // 接受，晚一纳秒也拒绝；不同时区写法表示同一时刻按相等处理）说明采样时该上限
 // 尚未生效，即使测量值、上限数值与超标标记互相对得上也必须拒绝。两个列表
-// 排列顺序不同不影响对应，成功读入后测量与判定各自保留原顺序。最后核对超标
+// 排列顺序不同不影响对应，成功读入后测量与判定各自保留原顺序。核对超标标记
+// 前还要先确认结论确实保存过：exceeded 是布尔字段，字段缺失或保存为 null
+// 反序列化后都是 false，与明确保存的 false 无法区分，只能按字段是否存在核对。
+// 已确认样品，以及已作废但仍保留逐项判定的样品，正常确认时整份与每条逐项超标
+// 标记都明确落盘，因此整份标记缺失或为 null、任一条逐项标记缺失或为 null，都
+// 是结论残缺：即使测量值、上限、生效时间齐全且按这些依据比较会得到达标，即使
+// 其余项目的标记都完整，也必须整次拒绝，不能把缺少结论当成已有的达标结论；多
+// 项目样品只缺一条逐项标记同样拒绝。错误信息点名样品编号，并区分缺少的是整份
+// 超标标记还是逐项超标标记，逐项缺失时同时点名项目。不按测量值重新生成标记、
+// 不用逐项结果补出整份标记、不改变样品状态或历史判定依据。明确保存的 false
+// 和 true 都属于已保存标记，接着核对超标
 // 标记与该样品已保存的判定依据一致：每条判定的超标标记必须严格符合该条保存
 // 的测量值与上限——测量值严格大于上限才是超标，小于或等于（包括等于、零与
 // 负数的合法组合）都应为达标；整份样品的超标标记必须与逐项结论一致，任一
@@ -179,10 +189,11 @@ type Store struct {
 // errors.Is(err, ErrCorruptRecord) 识别的错误失败，返回 nil 数据存放，
 // 错误信息点到具体样品编号与缺少原测量的原因（或具体项目）；原测量或逐项判定
 // 缺少测量值时点到具体项目，并说明缺少的是原测量值还是逐项判定中的测量值；判定缺少上限
-// 数值时点到具体项目；判定缺少上限生效时间或生效时间晚于采样时间时点到具体
+// 数值时点到具体项目；缺少整份超标标记时说明缺少的是整份标记，缺少逐项超标
+// 标记时点到具体项目；判定缺少上限生效时间或生效时间晚于采样时间时点到具体
 // 项目，晚于采样时间时同时带出两处时间（保留足以说明先后的小数秒）；单项超标标记有误时点到具体项目，整份标记有误时说明
 // 它与逐项结论不一致；不会静默跳过问题样品、不会择一保留或合并重复测量、
-// 不会补出缺失测量、测量值、判定、上限数值或生效时间、不会修正超标标记或重新判定、不会把它
+// 不会补出缺失测量、测量值、判定、上限数值、生效时间或超标标记、不会依据测量值重新生成标记、不会修正超标标记或重新判定、不会把它
 // 改成另一种状态、也不会把拒绝推迟到请求确认时，更不会改写原文件。待判定
 // 样品没有判定记录、待判定后作废的样品没有历史依据，均属正常，只要原测量
 // 完整就照常读入，不要求它们提前保存判定上限。
@@ -360,10 +371,11 @@ func Open(dir string) (*Store, error) {
 	if st.Points != nil {
 		s.points = st.Points
 	}
-	// JSON 反序列化把数值字段缺失与 null 都落成 float64 零值，与明确保存的零
-	// 无法区分，因此“有没有保存数值”只能在读取时按字段是否存在单独核对：
-	// 登记限值的 value、样品的原测量 value、逐项判定的 value 与 limit 都靠
-	// 这一次重新扫描探出。
+	// JSON 反序列化把数值字段缺失与 null 都落成 float64 零值、把超标标记字段
+	// 缺失与 null 都落成布尔零值 false，与明确保存的零和明确保存的 false 无法
+	// 区分，因此“有没有实际保存”只能在读取时按字段是否存在单独核对：
+	// 登记限值的 value、样品的原测量 value、逐项判定的 value 与 limit，以及整份
+	// 和每条逐项判定的 exceeded，都靠这一次重新扫描探出。
 	var missing missingFields
 	if st.Limits != nil || st.Samples != nil {
 		var err error
@@ -475,7 +487,8 @@ func Open(dir string) (*Store, error) {
 		// 一个原测量，
 		// 每个原测量项目都必须实际保存了测量值，原测量项目名重复也都是损坏，
 		// 带结论的样品还要求逐项判定与原测量完整对应、每条判定都实际保存了
-		// 测量值与上限数值、且保存的上限生效时间存在且不晚于采样时间。任一份
+		// 测量值、上限数值与超标标记（整份超标标记也必须实际保存；字段缺失或为
+		// null 都是结论残缺）、且保存的上限生效时间存在且不晚于采样时间。任一份
 		// 样品不通过，整次
 		// 打开都失败，不返回数据存放对象，也不静默跳过、择一保留、补测量、
 		// 补测量值、补判定、补上限或回写原文件。
@@ -623,23 +636,29 @@ func skipJSONValue(dec *json.Decoder) error {
 }
 
 // missingFields 汇总对数据文件逐字段核对的结果：JSON 反序列化把数值字段缺失
-// 与 null 都落成 float64 零值，与明确保存的零无法区分，因此“有没有保存数值”
-// 只能在读取时按字段是否存在单独核对。样品的三个 map 都以落盘样品编号为键，
-// 键内是缺少对应字段的项目名集合；登记限值的 map 以限值自身归属的（采样点，
+// 与 null 都落成 float64 零值、把超标标记字段缺失与 null 都落成布尔零值 false，
+// 与明确保存的零数值、明确保存的 false 无法区分，因此“有没有实际保存”只能在
+// 读取时按字段是否存在单独核对。样品的 map 都以落盘样品编号为键：
+// sampleExceeded 记录整份超标标记字段缺失或为 null 的样品；其余键内是缺少对应
+// 字段的项目名集合（resultExceeded 的键内是逐项超标标记缺失或为 null 的项目）；
+// 登记限值的 map 以限值自身归属的（采样点，
 // 项目）组为键，键内是缺少 value 字段的生效时刻（统一按 UTC 文本索引，不同
 // 时区写法表示同一时刻归为同一条）。limitPoint 同样以（采样点，项目）组加
 // 生效时刻定位到每一版，保留该版记录自身 pointId 字段按 JSON 解码后的文本：
 // nil 表示字段缺失或为 null，否则原样保留（含首尾空白），用于核对每版限值的
 // 采样点归属——归属只看记录自身保存的编号，不看 limits 的落盘集合键。明确
-// 写出数值零（以及负数、正数）的字段不在缺数值的任何一列。
+// 写出数值零（以及负数、正数）的字段不在缺数值的任何一列；明确写出 false 或
+// true 的超标标记也不在缺失列。
 type missingFields struct {
-	measValue   map[string]map[string]bool     // 原测量 value 字段缺失或为 null
-	resultValue map[string]map[string]bool     // 逐项判定 value 字段缺失或为 null
-	resultLimit map[string]map[string]bool     // 逐项判定 limit 字段缺失或为 null
-	limitValue  map[limitGroup]map[string]bool // 登记限值 value 字段缺失或为 null
-	limitPoint  map[limitGroup]map[string]*string
-	sampleID    map[string]*string // 每份样品记录自身的 id 字段：nil 表示字段缺失或为 null，否则为 JSON 解码后的文本
-	samplePoint map[string]*string // 每份样品记录自身的 pointId 字段：nil 表示字段缺失或为 null，否则为 JSON 解码后的文本
+	measValue      map[string]map[string]bool     // 原测量 value 字段缺失或为 null
+	resultValue    map[string]map[string]bool     // 逐项判定 value 字段缺失或为 null
+	resultLimit    map[string]map[string]bool     // 逐项判定 limit 字段缺失或为 null
+	resultExceeded map[string]map[string]bool     // 逐项判定 exceeded 字段缺失或为 null
+	sampleExceeded map[string]bool                // 样品整份 exceeded 字段缺失或为 null
+	limitValue     map[limitGroup]map[string]bool // 登记限值 value 字段缺失或为 null
+	limitPoint     map[limitGroup]map[string]*string
+	sampleID       map[string]*string // 每份样品记录自身的 id 字段：nil 表示字段缺失或为 null，否则为 JSON 解码后的文本
+	samplePoint    map[string]*string // 每份样品记录自身的 pointId 字段：nil 表示字段缺失或为 null，否则为 JSON 解码后的文本
 }
 
 // limitTimeKey 把限值生效时刻规范成可比较的文本键：统一到 UTC 后按纳秒精度
@@ -650,6 +669,12 @@ func limitTimeKey(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) 
 // 每份样品中每个原测量项目的 value、每条逐项判定的 value 与 limit，以及每一版
 // 登记限值的 value，字段缺失或保存为 null 都计入对应的缺失集合。明确写出数值
 // 零（以及负数、正数）的字段不在此列。
+//
+// 超标标记是布尔值，同样在这次扫描中按字段是否存在核对：已确认样品以及保留
+// 逐项判定的作废样品必须明确保存整份 exceeded，每条逐项判定也必须明确保存
+// exceeded；字段缺失或保存为 null 都计入对应缺失集合，不能因为反序列化后的
+// false 恰好与按保存依据比较得到的达标结论一致就当成已保存的达标结论。明确
+// 写出的 false（与 true 一样）是已保存的标记，不在缺失列。
 //
 // 每一版登记限值自身的 pointId 字段也按 JSON 解码后的原样文本保留（字段缺失
 // 或为 null 时记 nil，含首尾空白不整理），按（采样点，项目）组与生效时刻定位
@@ -666,14 +691,16 @@ func probeMissingFields(data []byte) (missingFields, error) {
 		Samples map[string]struct {
 			ID           *string `json:"id"`
 			PointID      *string `json:"pointId"`
+			Exceeded     *bool   `json:"exceeded"`
 			Measurements []struct {
 				Item  string   `json:"item"`
 				Value *float64 `json:"value"`
 			} `json:"measurements"`
 			Results []struct {
-				Item  string   `json:"item"`
-				Value *float64 `json:"value"`
-				Limit *float64 `json:"limit"`
+				Item     string   `json:"item"`
+				Value    *float64 `json:"value"`
+				Limit    *float64 `json:"limit"`
+				Exceeded *bool    `json:"exceeded"`
 			} `json:"results"`
 		} `json:"samples"`
 	}
@@ -737,6 +764,15 @@ func probeMissingFields(data []byte) (missingFields, error) {
 			missing.samplePoint = map[string]*string{}
 		}
 		missing.samplePoint[key] = smp.PointID
+		// 整份超标标记字段缺失或为 null 时记下该样品；是否要求标记存在由逐份
+		// 校验按状态决定（已确认样品、保留逐项判定的作废样品必须存在），探测
+		// 本身不对待判定样品下结论。
+		if smp.Exceeded == nil {
+			if missing.sampleExceeded == nil {
+				missing.sampleExceeded = map[string]bool{}
+			}
+			missing.sampleExceeded[key] = true
+		}
 		for _, m := range smp.Measurements {
 			if m.Value == nil {
 				note(&missing.measValue, key, m.Item)
@@ -748,6 +784,9 @@ func probeMissingFields(data []byte) (missingFields, error) {
 			}
 			if r.Limit == nil {
 				note(&missing.resultLimit, key, r.Item)
+			}
+			if r.Exceeded == nil {
+				note(&missing.resultExceeded, key, r.Item)
 			}
 		}
 	}
@@ -826,7 +865,17 @@ func probeMissingFields(data []byte) (missingFields, error) {
 // 后者同时带出两处时间（保留足以说明先后的小数秒）。多项目样品只有一项不符合，
 // 同样整份拒绝。不补填日期、不替换上限、不把样品退回待判定，也不重新计算结论。
 //
-// 对应关系与上限数值都通过后，超标标记还必须与这份样品已保存的判定依据一致：每条判定的
+// 对应关系与上限数值都通过后，还要先确认超标标记确实保存过：exceeded 是布尔
+// 字段，字段缺失或保存为 null 反序列化后都是 false，与明确保存的 false 无法
+// 区分，只能按字段是否存在核对。已确认样品、以及已确认后作废仍保留逐项判定
+// 的样品，正常确认会明确保存整份与每条逐项的超标标记；因此整份标记或任一条
+// 逐项标记缺失、为 null，都属于结论残缺，即使测量值、上限、生效时间齐全且按
+// 这些依据比较会得到达标，即使其余项目的标记都完整，也必须整次拒绝——读取残
+// 缺记录时不能把缺少结论当成已有的达标结论。多项目样品只缺一条逐项标记同样
+// 拒绝。错误信息点名样品编号，区分缺少的是整份超标标记还是逐项超标标记，逐项
+// 缺失时同时点名项目。不按测量值重新生成标记、不用逐项结果补整份标记、不改变
+// 状态或历史判定依据。明确保存的 false 与 true 都属于已保存标记，继续核对它
+// 们与依据是否一致：每条判定的
 // Exceeded 必须严格等于“该条保存的测量值 > 该条保存的上限”，测量值小于或等于
 // 上限（含等于、零或负数的合法数值组合）都应为达标；整份样品的 Exceeded 必须
 // 等于“是否有任一项超标”，全部达标则应为假。这里只核对已保存的依据本身，
@@ -1038,14 +1087,24 @@ func validateLoadedSample(key string, smp *Sample, missing missingFields, points
 				ErrCorruptRecord, id, r.Item)
 		}
 	}
-	// 超标标记必须与这份样品已保存的判定依据一致。单项的超标与否由共用的
-	// itemExceeded 判定（与确认新样品时同一规则：严格大于才超标，小于或等于
-	// 含等于、零或负数的合法组合都为达标），整份结论由 overallExceeded 汇总
-	// （任一单项超标即为真）。这里只按每条记录保存的测量值与上限判断，不重新
-	// 选择当前限值；单项标记与依据矛盾时点名该项目，整份标记与逐项结论矛盾时
-	// 单独说明。整份样品只允许一种矛盾先报出，但两者都会拒绝。
+	// 超标标记必须确实保存过，并且与这份样品已保存的判定依据一致。核对依据
+	// 之前先核对结论本身是否真的保存过：exceeded 是布尔字段，JSON 反序列化会把
+	// 字段缺失与 null 都落成 false，与明确保存的 false 无法区分，只能按字段是否
+	// 存在核对（由 probeMissingFields 探出）。已确认样品、以及已确认后作废仍保留
+	// 逐项判定的样品，正常确认时整份与每条逐项的超标标记都明确落盘，因此缺字段
+	// 或缺 null 都表示结论残缺，即使按该条保存的测量值与上限比较恰好得到达标、
+	// 即使其余项目的标记都完整，也不能把缺少结论当成已有的达标结论。多项目样品
+	// 只缺一条逐项标记同样整份拒绝。不按测量值重新生成标记、不用逐项结果补整份
+	// 标记、不改变状态或历史判定依据。明确保存的 false 与 true 一样属于已保存
+	// 标记，不在此列，继续按规则核对它们与保存依据是否一致。逐项问题先于整份
+	// 问题报出：每条判定先核对该条标记存在、再核对它与该条保存依据一致，然后才
+	// 核对整份标记存在、整份标记与逐项结论一致。
 	itemFlags := make([]bool, 0, len(smp.Results))
 	for _, r := range smp.Results {
+		if missing.resultExceeded[key][r.Item] {
+			return fmt.Errorf("%w: 样品 %s 的项目 %s 缺少逐项超标标记：exceeded 字段缺失或为 null，缺少结论不能当成已保存的达标结论",
+				ErrCorruptRecord, id, r.Item)
+		}
 		want := itemExceeded(r.Value, r.Limit)
 		if r.Exceeded != want {
 			return fmt.Errorf("%w: 样品 %s 的项目 %s 超标标记与保存的判定依据不一致：测量值 %g %s 上限 %g 应判为%s，却保存为%s",
@@ -1053,6 +1112,10 @@ func validateLoadedSample(key string, smp *Sample, missing missingFields, points
 				judgementText(want), judgementText(r.Exceeded))
 		}
 		itemFlags = append(itemFlags, want)
+	}
+	if missing.sampleExceeded[key] {
+		return fmt.Errorf("%w: 样品 %s 缺少整份超标标记：exceeded 字段缺失或为 null，不能把缺少结论当成已保存的达标结论，也不能用逐项判定补出整份标记",
+			ErrCorruptRecord, id)
 	}
 	anyExceeded := overallExceeded(itemFlags)
 	if smp.Exceeded != anyExceeded {

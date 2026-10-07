@@ -45,7 +45,7 @@ var (
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
 	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
-	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少状态或状态值不受支持、缺少采样时间、缺少采样点编号、采样点编号含首尾空白或采样点未登记、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，样品记录缺少编号、编号含首尾空白或集合编号与记录自身编号不一致的损坏样品记录，样品集合中样品编号重复的损坏数据，或缺少上限数值、缺少生效时间的损坏限值记录")
+	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少状态或状态值不受支持、缺少采样时间、缺少采样点编号、采样点编号含首尾空白或采样点未登记、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，样品记录缺少编号、编号含首尾空白或集合编号与记录自身编号不一致的损坏样品记录，样品集合中样品编号重复的损坏数据，或缺少上限数值、缺少生效时间、缺少采样点编号、采样点编号含首尾空白或采样点未登记的损坏限值记录")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -291,6 +291,27 @@ type Store struct {
 // 版的日期、不跳过这一版、不重新计算或改写样品结论，不把拒绝推迟到确认某份
 // 样品时，也不回写原文件。没有登记限值的空数据照常打开；生效时间完整的未来
 // 版本不是损坏，照常读入，确认时仍只选采样当时已生效的最近一版。
+//
+// 每一版登记限值还必须明确属于一个已经登记的采样点：正常登记时采样点必须先
+// 登记，打开已有本地数据时也要按同一规则核对限值归属，不能因为数值与生效
+// 时间完整就接受归属不明的版本——否则文件只登记了 P1、却保存了一版归属 P9
+// 的上限时，这版上限仍会被读入，后来登记 P9 并确认样品还会用上这条原本无法
+// 通过正常登记入口写入的限值。核对对象是每一版限值记录自身保存的 pointId，
+// 不是保存这组限值的集合键：pointId 字段缺失、保存为 null、为空字符串或仅
+// 含空白，都按缺少采样点编号处理；带首尾空白的编号也属于损坏，不能去掉空白
+// 后替它匹配一个采样点。完整编号按 JSON 解码后的文本与本文件已登记的采样点
+// 编号逐字匹配，不转换大小写：P1 与 p1 是不同编号；一处直接写 P1、另一处用
+// Unicode 转义表示同一文本则相同，中文编号同理。编号完整但没有对应登记记录
+// 时，明确说明该采样点未登记，不能凭限值或样品反过来补登记。这条核对针对
+// 文件中实际存在的每一版，与当前有没有样品、这一版是否已被样品采用无关：
+// 即使尚无样品，或者只有旧版、未来版本的归属有问题，也不能放行。任一版不
+// 符合要求，整次打开即以可被 errors.Is(err, ErrCorruptRecord) 识别的错误
+// 失败，返回 nil 数据存放，错误信息指出这是登记限值的归属问题、点到对应的
+// 测量项目，并区分编号缺失、含首尾空白和采样点未登记，后两种情况带出原
+// 编号；不能只读入其他正常记录，失败时保留原文件，不补登记采样点、不改写
+// 限值归属。核对排在样品归属核对之后：样品和限值同时引用未登记采样点时，
+// 仍沿用现有的样品归属错误。归属完整的限值继续按各自的采样点和项目分组
+// 读取；没有限值的正常数据照常打开，样品是否缺少适用上限仍在确认时判断。
 func Open(dir string) (*Store, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, fmt.Errorf("%w: 数据目录", ErrEmptyField)
@@ -364,17 +385,7 @@ func Open(dir string) (*Store, error) {
 		// （time.Equal 忽略时区写法、保留纳秒精度）：不同时区表示同一瞬间仍算
 		// 重复，相差一纳秒则是两版。任一组重复都返回 nil 存放，不合并、不择一、
 		// 不跳过该组或其他正常采样点与样品，也不回写原文件。
-		groups := make([]limitGroup, 0, len(s.limits))
-		for g := range s.limits {
-			groups = append(groups, g)
-		}
-		sort.Slice(groups, func(i, j int) bool {
-			if groups[i].pointID != groups[j].pointID {
-				return groups[i].pointID < groups[j].pointID
-			}
-			return groups[i].item < groups[j].item
-		})
-		for _, g := range groups {
+		for _, g := range sortedLimitGroups(s.limits) {
 			versions := s.limits[g]
 			sort.Slice(versions, func(i, j int) bool { return versions[i].Effective.Before(versions[j].Effective) })
 			s.limits[g] = versions
@@ -440,7 +451,52 @@ func Open(dir string) (*Store, error) {
 		}
 		s.samples = st.Samples
 	}
+	// 每一版登记限值都必须明确属于一个已经登记的采样点：正常登记时采样点
+	// 必须先登记，打开已有本地数据时也要补上同一核对，否则文件只登记了 P1、
+	// 却保存了一版归属 P9 的上限时，只要数值与生效时间完整这版上限仍会被
+	// 读入，后来登记 P9 并确认样品还会用上这条原本无法通过正常登记入口写入
+	// 的限值。核对对象是每一版限值记录自身的 pointId（分组时已按它归位），
+	// 不是保存这组限值的集合键：pointId 缺失、为 null、为空字符串或仅含空白
+	// 都算缺少采样点编号；带首尾空白的编号也不能整理后替它匹配。完整编号按
+	// JSON 解码后的文本与已登记编号逐字匹配，不转换大小写；匹配不上时明确
+	// 报告该采样点未登记，不能凭限值或样品反过来补登记。这条核对针对文件中
+	// 实际存在的每一版，与当前有没有样品、这一版是否已被样品采用无关：即使
+	// 尚无样品，或者只有旧版、未来版本的归属有问题，也整次拒绝。核对排在
+	// 样品归属核对之后：样品和限值同时引用未登记采样点时，沿用现有的样品
+	// 归属错误。不补登记采样点、不改写限值归属，也不回写原文件。
+	for _, g := range sortedLimitGroups(s.limits) {
+		for _, v := range s.limits[g] {
+			switch {
+			case strings.TrimSpace(v.PointID) == "":
+				return nil, fmt.Errorf("%w: 项目 %s 于 %s 生效的登记限值缺少采样点编号：pointId 字段缺失、为 null、为空字符串或仅含空白，登记限值必须明确属于一个已经登记的采样点",
+					ErrCorruptRecord, g.item, v.Effective.UTC())
+			case v.PointID != strings.TrimSpace(v.PointID):
+				return nil, fmt.Errorf("%w: 项目 %s 于 %s 生效的登记限值的采样点编号 %q 含首尾空白：编号必须完整且沿用正常登记保存的形式，不能整理空白后匹配采样点",
+					ErrCorruptRecord, g.item, v.Effective.UTC(), v.PointID)
+			}
+			if _, ok := s.points[v.PointID]; !ok {
+				return nil, fmt.Errorf("%w: 项目 %s 于 %s 生效的登记限值的采样点 %q 未登记：登记限值必须属于本文件中一个已经登记的采样点，不能凭限值记录或样品反过来补登记",
+					ErrCorruptRecord, g.item, v.Effective.UTC(), v.PointID)
+			}
+		}
+	}
 	return s, nil
+}
+
+// sortedLimitGroups 按（采样点，项目）字典序列出所有限值分组键，
+// 让打开时的逐组核对按确定性顺序报告问题。
+func sortedLimitGroups(m map[limitGroup][]Limit) []limitGroup {
+	groups := make([]limitGroup, 0, len(m))
+	for g := range m {
+		groups = append(groups, g)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].pointID != groups[j].pointID {
+			return groups[i].pointID < groups[j].pointID
+		}
+		return groups[i].item < groups[j].item
+	})
+	return groups
 }
 
 // duplicateSampleID 按文件中的原始 JSON 标记核对所有会被当作样品集合读取的

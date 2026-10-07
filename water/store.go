@@ -45,7 +45,7 @@ var (
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
 	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
-	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少状态或状态值不受支持、缺少采样时间、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，样品集合中样品编号重复的损坏数据，或缺少上限数值、缺少生效时间的损坏限值记录")
+	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少状态或状态值不受支持、缺少样品编号或两处样品编号不一致、缺少采样时间、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，样品集合中样品编号重复的损坏数据，或缺少上限数值、缺少生效时间的损坏限值记录")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -116,6 +116,25 @@ type Store struct {
 }
 
 // Open 打开（必要时创建）dir 下的本地数据存放。
+//
+// 读入时先核对每份样品在样品集合中的编号与其记录自身的 id 完全一致，并沿用
+// 正常录入后保存的编号形式：所有查询、确认与作废都按集合编号索引，记录里的
+// id 若写成另一份样品的编号，按点查看会给出错误编号，拿它确认或作废可能得到
+// “样品不存在”，也可能落到另一份真正同编号的记录上。id 字段缺失、保存为
+// null、为空字符串或仅含空白都算记录缺少编号；集合键或记录 id 任一处带首尾
+// 空白也算损坏，不能去空白整理后放行。两处都完整后再按 JSON 解码后的文本逐字
+// 比较：不转换大小写、不替换字符，一处直接写 S1、另一处用 Unicode 转义表示
+// 同一文本可以接受；S1 与 s1、S1 与 S2 则不一致；中文和编号内部的合法字符
+// （含内部空白）照常使用。这条要求对待判定、已确认和已作废样品同样生效，
+// 测量与逐项判定依据完整也不能代替编号正确；发现问题时整次打开以可被
+// errors.Is(err, ErrCorruptRecord) 识别的错误失败，返回 nil 数据存放，错误信息
+// 指出集合中的编号，并区分记录缺少编号（再区分字段缺失/为 null 与空串/仅含
+// 空白）、编号含首尾空白和两处编号不一致，不一致时同时带出集合编号与记录 id，
+// 让调用方知道是哪条记录对不上；同一文件里其他样品正常也不能只读入正常部分。
+// 读取失败保留原文件，不补编号、不移动或合并条目，不改变状态或重新判定。
+// 这是单份记录内部两处编号对不上的问题，与样品集合层的同编号重复相互独立，
+// 两种错误信息可区分；样品集合为空或缺失仍可打开，不要求尚未录入样品的数据
+// 已有编号。
 //
 // 读入时先核对每份样品都明确写有三种状态之一：pending（待判定）、confirmed
 // （已确认）、voided（已作废）。状态决定样品能否产生有效结论，原测量完整、
@@ -207,7 +226,8 @@ type Store struct {
 // 全部样品，不以是否已有判定结果为条件。发现重复编号时整次打开以可被
 // errors.Is(err, ErrCorruptRecord) 识别的错误失败，返回 nil 数据存放，
 // 错误信息指出重复的样品编号并说明样品集合中存在重复编号，使调用方能把它与
-// 同一份样品内部测量项目重复的问题区分开；同一文件里其他样品再正常也不只
+// 同一份样品内部测量项目重复的问题、以及单份记录集合编号与其自身 id 两处编号
+// 不一致的问题区分开；同一文件里其他样品再正常也不只
 // 读入正常部分，不删除条目、不合并内容、不择一保留、不补出判定、不重算历史
 // 结论，也不回写原文件。多个非空样品集合没有重复编号、其余内容合法时沿用
 // 现有读取行为，不因集合字段出现多次而拒绝；样品集合为空或缺失照常打开。
@@ -524,13 +544,15 @@ func skipJSONValue(dec *json.Decoder) error {
 }
 
 // missingFields 汇总对数据文件逐字段核对的结果：JSON 反序列化把数值字段缺失
-// 与 null 都落成 float64 零值，与明确保存的零无法区分，因此“有没有保存数值”
-// 只能在读取时按字段是否存在单独核对。样品的三个 map 都以落盘样品编号为键，
-// 键内是缺少对应字段的项目名集合；登记限值的 map 以限值自身归属的（采样点，
-// 项目）组为键，键内是缺少 value 字段的生效时刻（统一按 UTC 文本索引，不同
-// 时区写法表示同一时刻归为同一条）。明确写出数值零（以及负数、正数）的不在
-// 任何一列。
+// 与 null 都落成 float64 零值、把 id 缺失与 null 都落成空字符串，与明确保存的
+// 零或空串无法区分，因此“有没有实际保存字段”只能在读取时按字段是否存在单独
+// 核对。sampleID 以落盘样品集合编号为键，记录的 id 字段缺失或为 null 时记入；
+// 样品的三个项目 map 同样以落盘样品编号为键，键内是缺少对应字段的项目名集合；
+// 登记限值的 map 以限值自身归属的（采样点，项目）组为键，键内是缺少 value
+// 字段的生效时刻（统一按 UTC 文本索引，不同时区写法表示同一时刻归为同一条）。
+// 明确写出数值零（以及负数、正数）的字段不在任何一列。
 type missingFields struct {
+	sampleID    map[string]bool                // 样品记录 id 字段缺失或为 null
 	measValue   map[string]map[string]bool     // 原测量 value 字段缺失或为 null
 	resultValue map[string]map[string]bool     // 逐项判定 value 字段缺失或为 null
 	resultLimit map[string]map[string]bool     // 逐项判定 limit 字段缺失或为 null
@@ -541,10 +563,11 @@ type missingFields struct {
 // 格式化，不同时区写法表示同一时刻归为同一条，相差一纳秒仍是两条。
 func limitTimeKey(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
 
-// probeMissingFields 重新扫描数据文件，找出没有实际保存数值的字段：
-// 每份样品中每个原测量项目的 value、每条逐项判定的 value 与 limit，以及每一版
-// 登记限值的 value，字段缺失或保存为 null 都计入对应的缺失集合。明确写出数值
-// 零（以及负数、正数）的字段不在此列。
+// probeMissingFields 重新扫描数据文件，找出没有实际保存的字段：每份样品记录的
+// id、每个原测量项目的 value、每条逐项判定的 value 与 limit，以及每一版登记
+// 限值的 value，字段缺失或保存为 null 都计入对应的缺失集合。明确写出空字符串
+// 的 id 不在 id 缺失集合里（它由编号内容核对拒绝），明确写出数值零（以及负数、
+// 正数）的字段也不在此列。
 func probeMissingFields(data []byte) (missingFields, error) {
 	var probe struct {
 		Limits map[string][]struct {
@@ -554,6 +577,7 @@ func probeMissingFields(data []byte) (missingFields, error) {
 			Effective time.Time `json:"effective"`
 		} `json:"limits"`
 		Samples map[string]struct {
+			ID           *string `json:"id"`
 			Measurements []struct {
 				Item  string   `json:"item"`
 				Value *float64 `json:"value"`
@@ -595,6 +619,14 @@ func probeMissingFields(data []byte) (missingFields, error) {
 		}
 	}
 	for key, smp := range probe.Samples {
+		// id 字段缺失或保存为 null 都算记录缺少编号；明确写出空字符串不在
+		// 此列，它由编号内容核对（去首尾空白后为空）报告，两种问题要区分。
+		if smp.ID == nil {
+			if missing.sampleID == nil {
+				missing.sampleID = map[string]bool{}
+			}
+			missing.sampleID[key] = true
+		}
 		for _, m := range smp.Measurements {
 			if m.Value == nil {
 				note(&missing.measValue, key, m.Item)
@@ -613,6 +645,22 @@ func probeMissingFields(data []byte) (missingFields, error) {
 }
 
 // validateLoadedSample 校验一份从本地文件读入的样品记录。
+//
+// 首先核对集合编号 key 与记录自身的 smp.ID：二者必须完全一致，并沿用正常录入
+// 保存的编号形式。查询、确认与作废全部按集合编号索引，记录 id 却是另一套文本
+// 时，按点查看给出的编号拿去操作可能查无此样，也可能落到另一份真正同编号的
+// 记录上。id 字段缺失或为 null（由 probeMissingFields 按字段是否存在探出，
+// 与明确写出的空字符串区分）、id 为空字符串或仅含空白都算记录缺少编号；
+// key 或 smp.ID 任一处带首尾空白都不能去空白整理后放行。两处都完整后按 JSON
+// 解码后的完整文本逐字比较：不转换大小写、不替换字符，一处直接写 S1、另一处
+// 用 Unicode 转义表示同一文本可以接受；S1 与 s1、S1 与 S2 则不一致；中文与
+// 编号内部的合法字符（含内部空白）仍可使用。这条核对先于状态、采样时间与
+// 测量等一切内容检查：测量与判定依据再完整也不能代替编号正确；它对待判定、
+// 已确认和已作废样品同样生效。三种问题分别给出不同错误信息：记录缺少编号
+// （字段缺失/null 与空串/仅含空白再分开说明）、编号含首尾空白、两处编号不一致
+// （同时带出集合编号与记录 id）。不补编号、不移动或合并条目、不改变状态或
+// 重新判定，整次打开失败、不回写原文件。这是单份记录内部两处编号对不上的
+// 问题，不同于样品集合层的同编号重复。
 //
 // 每份样品都必须明确写有三种状态之一（pending、confirmed、voided）：状态决定
 // 样品能否产生有效结论，原测量完整、逐项判定齐全或作废原因仍在都不能代替明确的
@@ -697,10 +745,33 @@ func validateLoadedSample(key string, smp *Sample, missing missingFields) error 
 	if smp == nil {
 		return fmt.Errorf("%w: 样品 %s 的记录为空", ErrCorruptRecord, key)
 	}
-	id := smp.ID
-	if id == "" {
-		id = key
+	// 集合编号与记录自身编号必须一致。所有查询、确认与作废都按集合编号索引，
+	// 记录里的 id 却是另一套文本时，按点查看给出的编号拿去确认或作废可能落到
+	// 别的记录或查无此样；因此这层核对先于状态、采样时间等一切逐份内容检查：
+	// 测量与判定依据再完整也不能代替编号正确。编号以正常录入保存的形式为准
+	// （录入时已去首尾空白），两处都不允许带首尾空白，发现也不能整理后放行。
+	// 编号按 JSON 解码后的完整文本逐字比较：不转换大小写、不替换字符，一处
+	// 直接写 S1、另一处用 Unicode 转义表示同一文本可以接受；S1 与 s1、S1 与
+	// S2 则不一致；中文与编号内部的空白等合法字符照常使用。这条核对对待判定、
+	// 已确认和已作废样品同样生效，整份文件中其他样品正常也不能只读入正常部分，
+	// 不补编号、不移动或合并条目、不改变状态或重新判定，也不回写原文件。
+	if missing.sampleID[key] {
+		return fmt.Errorf("%w: 样品集合编号 %s 下的记录缺少编号：id 字段缺失或为 null",
+			ErrCorruptRecord, key)
 	}
+	if strings.TrimSpace(smp.ID) == "" {
+		return fmt.Errorf("%w: 样品集合编号 %s 下的记录缺少编号：id 为空字符串或仅含空白",
+			ErrCorruptRecord, key)
+	}
+	if smp.ID != strings.TrimSpace(smp.ID) || key != strings.TrimSpace(key) {
+		return fmt.Errorf("%w: 样品集合编号 %q 与记录自身编号 %q 中存在带首尾空白的编号：编号带首尾空白不能整理后放行",
+			ErrCorruptRecord, key, smp.ID)
+	}
+	if smp.ID != key {
+		return fmt.Errorf("%w: 样品集合编号 %q 与记录自身编号 %q 不一致：样品在集合中的编号必须与记录 id 完全相同",
+			ErrCorruptRecord, key, smp.ID)
+	}
+	id := smp.ID
 	// 每份样品都必须明确写有三种状态之一（pending、confirmed、voided）：状态
 	// 决定样品能否产生有效结论，原测量完整、逐项判定齐全或作废原因仍在都不能
 	// 代替明确的状态。status 字段缺失、为 null 或为空字符串，反序列化后都是

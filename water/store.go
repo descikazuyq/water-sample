@@ -45,7 +45,7 @@ var (
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
 	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
-	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少状态或状态值不受支持、缺少采样时间、缺少采样点编号、采样点编号含首尾空白或采样点未登记、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，样品记录缺少编号、编号含首尾空白或集合编号与记录自身编号不一致的损坏样品记录，样品集合中样品编号重复的损坏数据，或缺少上限数值、缺少生效时间的损坏限值记录")
+	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少状态或状态值不受支持、缺少采样时间、缺少采样点编号、采样点编号含首尾空白或采样点未登记、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，样品记录缺少编号、编号含首尾空白或集合编号与记录自身编号不一致的损坏样品记录，样品集合中样品编号重复的损坏数据，或缺少采样点编号、采样点编号含首尾空白或采样点未登记、缺少上限数值、缺少生效时间的损坏限值记录")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -252,6 +252,31 @@ type Store struct {
 // 已登记但尚未登记限值的待判定样品仍可打开，是否缺少采样当时适用的上限继续由
 // 确认操作判断；没有样品的空目录和空样品集合也照常打开。
 //
+// 每一版登记限值也必须明确属于一个已经登记的采样点：沿用“登记上限前必须先
+// 登记采样点”的规则，打开已有本地数据时按同一规则核对限值归属，不能因为数值
+// 与生效时间完整就接受归属不明的上限——否则文件只登记了 P1、却保存着一版
+// 归属 P9 的 pH 上限时，这版上限会被读入，后来登记 P9 并确认样品还会用上
+// 这条原本无法通过正常登记入口写入的限值。核对对象是每一版限值记录自身保存的
+// pointId（按 JSON 解码后的文本），不是保存这组限值的 limits 集合键；含
+// U+0000 的不同组合即使共用旧版集合键，也只按各自记录的编号核对。pointId
+// 字段缺失、保存为 null、为空字符串或仅含空白，都算这版限值缺少采样点编号；
+// 带首尾空白的编号也属于损坏，不能去掉空白后替它匹配。完整编号按读取后的文本
+// 与本文件已登记的采样点编号逐字比较，不转换大小写：P1 与 p1 不同；一处直接
+// 写出、另一处用 Unicode 转义表示同一文本可以匹配，中文编号同理。编号完整却
+// 找不到登记记录时，明确说明该采样点未登记，不能凭限值或样品反过来补登记。
+// 这条核对针对文件中实际存在的每一版限值，与当前有没有样品、这一版是否已被
+// 样品采用无关：只有旧版或未来版本归属有问题也一样拒绝，文件尚未录入任何样品
+// 时也不例外。任一版不符合要求，整次 Open 都失败，返回 nil 数据存放，错误可
+// 被 errors.Is(err, ErrCorruptRecord) 识别；错误说明指出这是登记限值的归属
+// 问题、点到对应测量项目与生效时间，并区分编号缺失、含首尾空白和未登记，后两
+// 种情况原样带出该版保存的编号。其他限值与样品再正常也不能只读入正常部分；
+// 失败时保留原文件，不补登记采样点、不改写限值归属，也不把拒绝推迟到确认某份
+// 样品时。若样品和限值同时引用未登记采样点，仍沿用现有的样品归属错误（保留
+// 样品编号与未登记说明）。归属完整的限值继续按各自的采样点和项目分组，共用
+// 旧版集合键的不同组合以及编号内部含 U+0000 的合法记录仍可读取；没有限值的
+// 正常数据照常打开，待判定样品是否缺少适用上限仍在确认时判断，已有完整样品的
+// 状态与历史判定依据保留，不因这项核对重新计算结论。
+//
 // 限值版本同样在打开时核对：同一采样点、同一项目（归属只看每条记录自身的
 // pointId 与 item，不看落盘键，含 U+0000 的不同组合即使共用旧版存储键也各自
 // 成组）下只要存在两条生效时刻相同的上限，整次打开即以可被
@@ -347,6 +372,11 @@ func Open(dir string) (*Store, error) {
 			return nil, fmt.Errorf("water: 读取数据文件失败: %w", err)
 		}
 	}
+	// limitOwnershipErr 记录第一条（分组与版本顺序确定）登记限值归属错误，先不
+	// 返回：若同一份文件里还有样品引用了未登记采样点，沿用现有的样品归属错误
+	// （保留样品编号与未登记说明）；样品全部通过核对后，限值归属错误仍让整次
+	// 打开失败、返回 nil 数据存放。
+	var limitOwnershipErr error
 	if st.Limits != nil {
 		// 不按落盘键分组：键可能是旧版本用单字符拼接生成的，包含 U+0000 的
 		// 不同（采样点，项目）组合会共用同一个键。以每条限值自身的两个字段为准，
@@ -378,6 +408,27 @@ func Open(dir string) (*Store, error) {
 			versions := s.limits[g]
 			sort.Slice(versions, func(i, j int) bool { return versions[i].Effective.Before(versions[j].Effective) })
 			s.limits[g] = versions
+			// 每一版限值都必须先通过采样点归属核对：核对对象是这一版记录自身
+			// 保存的 pointId（missing.limitPoint 保留按 JSON 解码后的原样文本），
+			// 不是 limits 的落盘集合键。字段缺失、为 null、为空字符串或仅含空白
+			// 都算缺少采样点编号；带首尾空白的编号不能整理后匹配；完整编号与本
+			// 文件已登记编号逐字比较、不转换大小写，匹配不上即采样点未登记，不
+			// 能凭其他限值或样品反过来补登记。同一组各版的解码后编号相同，归属
+			// 结论也一致；归属有问题的组先记下第一条错误（顺序确定），并不再
+			// 参与生效时间、缺数值与重复时刻核对，确保这类文件统一以
+			// ErrCorruptRecord 的归属错误失败，而不是被其他检查抢先报成别的问题。
+			groupBad := false
+			for _, v := range versions {
+				if oerr := limitPointOwnershipError(g, v, missing, s.points); oerr != nil {
+					groupBad = true
+					if limitOwnershipErr == nil {
+						limitOwnershipErr = oerr
+					}
+				}
+			}
+			if groupBad {
+				continue
+			}
 			for _, v := range versions {
 				// 每一版限值都必须写明从什么时候生效：effective 字段缺失、保存为
 				// null 或落盘为 Go 零时间，反序列化后都是零时间，一律视为缺少生效
@@ -439,6 +490,12 @@ func Open(dir string) (*Store, error) {
 			}
 		}
 		s.samples = st.Samples
+	}
+	// 样品已全部通过（或没有样品）：登记限值的归属错误不能放行，整次打开
+	// 失败并返回 nil 数据存放。走到这里说明没有样品归属错误需要沿用——若
+	// 样品和限值同时引用未登记采样点，上面的样品核对已经先返回。
+	if limitOwnershipErr != nil {
+		return nil, limitOwnershipErr
 	}
 	return s, nil
 }
@@ -570,15 +627,19 @@ func skipJSONValue(dec *json.Decoder) error {
 // 只能在读取时按字段是否存在单独核对。样品的三个 map 都以落盘样品编号为键，
 // 键内是缺少对应字段的项目名集合；登记限值的 map 以限值自身归属的（采样点，
 // 项目）组为键，键内是缺少 value 字段的生效时刻（统一按 UTC 文本索引，不同
-// 时区写法表示同一时刻归为同一条）。明确写出数值零（以及负数、正数）的不在
-// 任何一列。
+// 时区写法表示同一时刻归为同一条）。limitPoint 同样以（采样点，项目）组加
+// 生效时刻定位到每一版，保留该版记录自身 pointId 字段按 JSON 解码后的文本：
+// nil 表示字段缺失或为 null，否则原样保留（含首尾空白），用于核对每版限值的
+// 采样点归属——归属只看记录自身保存的编号，不看 limits 的落盘集合键。明确
+// 写出数值零（以及负数、正数）的字段不在缺数值的任何一列。
 type missingFields struct {
 	measValue   map[string]map[string]bool     // 原测量 value 字段缺失或为 null
 	resultValue map[string]map[string]bool     // 逐项判定 value 字段缺失或为 null
 	resultLimit map[string]map[string]bool     // 逐项判定 limit 字段缺失或为 null
 	limitValue  map[limitGroup]map[string]bool // 登记限值 value 字段缺失或为 null
-	sampleID    map[string]*string             // 每份样品记录自身的 id 字段：nil 表示字段缺失或为 null，否则为 JSON 解码后的文本
-	samplePoint map[string]*string             // 每份样品记录自身的 pointId 字段：nil 表示字段缺失或为 null，否则为 JSON 解码后的文本
+	limitPoint  map[limitGroup]map[string]*string
+	sampleID    map[string]*string // 每份样品记录自身的 id 字段：nil 表示字段缺失或为 null，否则为 JSON 解码后的文本
+	samplePoint map[string]*string // 每份样品记录自身的 pointId 字段：nil 表示字段缺失或为 null，否则为 JSON 解码后的文本
 }
 
 // limitTimeKey 把限值生效时刻规范成可比较的文本键：统一到 UTC 后按纳秒精度
@@ -589,10 +650,15 @@ func limitTimeKey(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) 
 // 每份样品中每个原测量项目的 value、每条逐项判定的 value 与 limit，以及每一版
 // 登记限值的 value，字段缺失或保存为 null 都计入对应的缺失集合。明确写出数值
 // 零（以及负数、正数）的字段不在此列。
+//
+// 每一版登记限值自身的 pointId 字段也按 JSON 解码后的原样文本保留（字段缺失
+// 或为 null 时记 nil，含首尾空白不整理），按（采样点，项目）组与生效时刻定位
+// 到具体哪一版，供打开时核对每版限值的采样点归属；归属只看记录自身保存的编号，
+// 不看 limits 的落盘集合键。
 func probeMissingFields(data []byte) (missingFields, error) {
 	var probe struct {
 		Limits map[string][]struct {
-			PointID   string    `json:"pointId"`
+			PointID   *string   `json:"pointId"`
 			Item      string    `json:"item"`
 			Value     *float64  `json:"value"`
 			Effective time.Time `json:"effective"`
@@ -625,19 +691,35 @@ func probeMissingFields(data []byte) (missingFields, error) {
 		(*m)[key][item] = true
 	}
 	// 登记限值按每条记录自身的采样点与项目归组（与读取时的重新分组一致），
-	// 组内按生效时刻定位到具体哪一版缺少数值；不看落盘键。
+	// 组内按生效时刻定位到具体哪一版缺少数值；不看落盘键。pointId 字段缺失或
+	// 为 null 时按空编号归组，随后由归属核对报“缺少采样点编号”，不能让它借
+	// 落盘集合键冒充归属。
 	for _, versions := range probe.Limits {
 		for _, lim := range versions {
+			pointID := ""
+			if lim.PointID != nil {
+				pointID = *lim.PointID
+			}
+			g := limitGroup{pointID: pointID, item: lim.Item}
 			if lim.Value == nil {
 				if missing.limitValue == nil {
 					missing.limitValue = map[limitGroup]map[string]bool{}
 				}
-				g := limitGroup{pointID: lim.PointID, item: lim.Item}
 				if missing.limitValue[g] == nil {
 					missing.limitValue[g] = map[string]bool{}
 				}
 				missing.limitValue[g][limitTimeKey(lim.Effective)] = true
 			}
+			// 保留这一版记录自身 pointId 字段按 JSON 解码后的原样文本（nil 表示
+			// 字段缺失或为 null，含首尾空白也不整理），归属核对只认这里，不认
+			// limits 的落盘集合键。
+			if missing.limitPoint == nil {
+				missing.limitPoint = map[limitGroup]map[string]*string{}
+			}
+			if missing.limitPoint[g] == nil {
+				missing.limitPoint[g] = map[string]*string{}
+			}
+			missing.limitPoint[g][limitTimeKey(lim.Effective)] = lim.PointID
 		}
 	}
 	for key, smp := range probe.Samples {
@@ -977,6 +1059,43 @@ func validateLoadedSample(key string, smp *Sample, missing missingFields, points
 		return fmt.Errorf("%w: 样品 %s 的整份超标标记与逐项判定结论不一致：逐项判定中%s，整份标记却保存为%s",
 			ErrCorruptRecord, id,
 			overallText(anyExceeded), judgementText(smp.Exceeded))
+	}
+	return nil
+}
+
+// limitPointOwnershipError 核对一版登记限值自身保存的采样点归属。
+//
+// 核对对象是这版记录自身 pointId 字段按 JSON 解码后的文本（由
+// probeMissingFields 保留在 missing.limitPoint 中），不是 limits 的落盘集合
+// 键：正常登记入口要求采样点先登记，打开已有本地数据时也要按同一规则核对，
+// 否则文件只登记了 P1、却保存着一版归属 P9 的上限时，只要数值与生效时间完整
+// 就会被读入，后来登记 P9 并确认样品还会用上这条原本无法写入的限值。
+//
+// pointId 字段缺失、保存为 null、为空字符串或仅含空白，都算这版限值缺少采样
+// 点编号；带首尾空白的编号属于损坏，不能去掉空白后替它匹配一个采样点。完整
+// 编号按 JSON 解码后的文本与本文件已登记编号逐字比较，不转换大小写：P1 与
+// p1 是不同编号；一处直接写 P1、另一处用 Unicode 转义表示同一文本则相同，
+// 中文编号同理，编号内部的 U+0000 也不影响逐字匹配。编号完整但没有对应登记
+// 记录时，明确说明该采样点未登记，不能凭其他限值或样品反过来补登记。
+//
+// 三种问题分别给出不同的错误信息，都以 ErrCorruptRecord 包装、点到对应测量
+// 项目与生效时间；含首尾空白与未登记时原样带出该版保存的编号。任一版不符合
+// 都由调用方让整次 Open 失败、返回 nil 数据存放，不跳过这一版、不补登记采样
+// 点、不改写归属，也不回写原文件；即使尚无样品，或出问题的只是旧版、未来
+// 版本也一样。
+func limitPointOwnershipError(g limitGroup, v Limit, missing missingFields, points map[string]SamplingPoint) error {
+	raw := missing.limitPoint[g][limitTimeKey(v.Effective)]
+	switch {
+	case raw == nil || strings.TrimSpace(*raw) == "":
+		return fmt.Errorf("%w: 项目 %s 于 %s 生效的登记限值缺少采样点编号：pointId 字段缺失、为 null、为空字符串或仅含空白，登记限值必须先属于一个已经登记的采样点，不能用 limits 集合键或其他限值补出归属",
+			ErrCorruptRecord, g.item, v.Effective.UTC())
+	case *raw != strings.TrimSpace(*raw):
+		return fmt.Errorf("%w: 项目 %s 于 %s 生效的登记限值的采样点编号 %q 含首尾空白：编号必须完整且沿用正常登记保存的形式，不能整理空白后匹配采样点",
+			ErrCorruptRecord, g.item, v.Effective.UTC(), *raw)
+	}
+	if _, ok := points[*raw]; !ok {
+		return fmt.Errorf("%w: 项目 %s 于 %s 生效的登记限值归属的采样点 %q 未登记：登记限值必须属于本文件中一个已经登记的采样点，不能凭限值或样品反过来补登记",
+			ErrCorruptRecord, g.item, v.Effective.UTC(), *raw)
 	}
 	return nil
 }

@@ -381,12 +381,14 @@ func TestOpenLimitMissingValueWithinOldCollidedKey(t *testing.T) {
 	if oldKey != "P"+"\x00"+zeroItem {
 		t.Fatal("测试前提：两个组合应拼出同一个旧键")
 	}
-	// 完整的一组与缺数值的一组共用同一个旧版存储键。先经 Go 结构体序列化
-	// 落盘，再按通用 JSON 结构把第二条的 value 字段删掉，构造出缺少数值的
-	// 限值记录（含 U+0000 的文本落盘时被转义，直接拼原始字符串不可靠）。
+	// 完整的一组与缺数值的一组共用同一个旧版存储键；两组各自归属的采样点都已
+	// 登记（新核对要求限值先属于已登记采样点），这里只制造缺数值损坏。先经 Go
+	// 结构体序列化落盘，再按通用 JSON 结构把第二条的 value 字段删掉，构造出缺少
+	// 数值的限值记录（含 U+0000 的文本落盘时被转义，直接拼原始字符串不可靠）。
 	writeDiskFile(t, dir, diskState{
 		Points: map[string]SamplingPoint{
-			"P": {ID: "P", Name: "普通编号"},
+			"P":       {ID: "P", Name: "普通编号"},
+			zeroPoint: {ID: zeroPoint, Name: "带零编号"},
 		},
 		Limits: map[string][]Limit{
 			oldKey: {

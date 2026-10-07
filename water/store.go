@@ -45,7 +45,7 @@ var (
 	ErrVoided             = errors.New("water: 样品已作废，不能再确认")
 	ErrVoidReasonConflict = errors.New("water: 作废原因与已有记录不一致")
 	ErrInvalidText        = errors.New("water: 采样点编号、名称、项目名、样品编号或作废原因不是合法的 UTF-8 文本")
-	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少状态或状态值不受支持、缺少采样时间、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，样品记录缺少编号、编号含首尾空白或集合编号与记录自身编号不一致的损坏样品记录，样品集合中样品编号重复的损坏数据，或缺少上限数值、缺少生效时间的损坏限值记录")
+	ErrCorruptRecord      = errors.New("water: 本地数据中存在缺少状态或状态值不受支持、缺少采样时间、缺少采样点编号、采样点编号含首尾空白或采样点未登记、缺少原测量、原测量或逐项判定缺少测量值、测量项目重复、测量项目与逐项判定对应不上、逐项判定缺少上限数值、逐项判定缺少上限生效时间或生效时间晚于采样时间、超标标记与保存的判定依据不一致的损坏样品记录，样品记录缺少编号、编号含首尾空白或集合编号与记录自身编号不一致的损坏样品记录，样品集合中样品编号重复的损坏数据，或缺少上限数值、缺少生效时间的损坏限值记录")
 )
 
 // SamplingPoint 是按编号唯一登记的采样点。
@@ -232,6 +232,26 @@ type Store struct {
 // 不同样品都包含同一测量项目（如各自都有 pH）或同名字段是正常数据，不属于
 // 样品编号重复。
 //
+// 每份样品还必须明确属于一个已经登记的采样点：正常录入时采样点必须先登记，
+// 打开已有本地数据时也要按同一规则核对样品归属，不能因为其余内容通过检查就
+// 接受归属不明的记录——否则文件只登记了 P1、样品却写着 P9 时，已确认记录
+// 甚至能作为 P9 的最近有效结果返回。pointId 字段缺失、保存为 null、为空字符串
+// 或仅含空白，都按缺少采样点编号处理；带首尾空白的编号也属于损坏，不能去掉
+// 空白后替它找到一个采样点。完整编号按 JSON 解码后的文本与已登记编号逐字
+// 匹配，不转换大小写：P1 与 p1 是不同编号；一处直接写 P1、另一处用 Unicode
+// 转义表示同一文本则相同，中文编号同理。编号完整但没有对应登记记录时，明确
+// 说明该采样点未登记，不能从限值记录或其他样品推测它存在。这条核对适用于
+// 待判定、已确认和已作废样品：作废记录仍供按点核对，不能放过丢失的归属；
+// 已确认样品的判定依据完整，也不能代替采样点已经登记。只要一份样品不符合
+// 要求，整次 Open 就失败，返回 nil 数据存放，错误可被
+// errors.Is(err, ErrCorruptRecord) 识别；错误信息指出样品编号，并区分编号
+// 缺失、含首尾空白和采样点未登记，后两种情况带出原采样点编号，便于找出对应
+// 记录。其他样品正常也不能只读入正常部分；失败时保留原文件，不补登记采样点、
+// 不改写样品归属或已有结论。归属完整的记录继续按现有规则读取，原状态、测量
+// 与历史判定依据照常保留，按点列表及最近有效结果的排序和作废资格不变。采样点
+// 已登记但尚未登记限值的待判定样品仍可打开，是否缺少采样当时适用的上限继续由
+// 确认操作判断；没有样品的空目录和空样品集合也照常打开。
+//
 // 限值版本同样在打开时核对：同一采样点、同一项目（归属只看每条记录自身的
 // pointId 与 item，不看落盘键，含 U+0000 的不同组合即使共用旧版存储键也各自
 // 成组）下只要存在两条生效时刻相同的上限，整次打开即以可被
@@ -396,6 +416,8 @@ func Open(dir string) (*Store, error) {
 	if st.Samples != nil {
 		// 逐份校验后才整体接收：每份样品都必须先通过编号核对（集合编号与
 		// 记录自身 id 按 JSON 解码文本逐字一致，不缺编号、不含首尾空白），再
+		// 通过采样点归属核对（pointId 完整、不含首尾空白，且逐字命中一个
+		// 已登记的采样点，不能凭限值记录或其他样品推测采样点存在），然后才
 		// 明确写有三种状态之一（缺失、
 		// null、空字符串或其他字符串都是损坏），任何状态的样品都必须保留采样
 		// 时间（字段缺失、null 或零时间都是损坏），必须至少保留
@@ -412,7 +434,7 @@ func Open(dir string) (*Store, error) {
 		}
 		sort.Strings(ids)
 		for _, id := range ids {
-			if err := validateLoadedSample(id, st.Samples[id], missing); err != nil {
+			if err := validateLoadedSample(id, st.Samples[id], missing, s.points); err != nil {
 				return nil, err
 			}
 		}
@@ -556,6 +578,7 @@ type missingFields struct {
 	resultLimit map[string]map[string]bool     // 逐项判定 limit 字段缺失或为 null
 	limitValue  map[limitGroup]map[string]bool // 登记限值 value 字段缺失或为 null
 	sampleID    map[string]*string             // 每份样品记录自身的 id 字段：nil 表示字段缺失或为 null，否则为 JSON 解码后的文本
+	samplePoint map[string]*string             // 每份样品记录自身的 pointId 字段：nil 表示字段缺失或为 null，否则为 JSON 解码后的文本
 }
 
 // limitTimeKey 把限值生效时刻规范成可比较的文本键：统一到 UTC 后按纳秒精度
@@ -576,6 +599,7 @@ func probeMissingFields(data []byte) (missingFields, error) {
 		} `json:"limits"`
 		Samples map[string]struct {
 			ID           *string `json:"id"`
+			PointID      *string `json:"pointId"`
 			Measurements []struct {
 				Item  string   `json:"item"`
 				Value *float64 `json:"value"`
@@ -624,6 +648,13 @@ func probeMissingFields(data []byte) (missingFields, error) {
 			missing.sampleID = map[string]*string{}
 		}
 		missing.sampleID[key] = smp.ID
+		// 记录自身的 pointId 字段同样按 JSON 解码后的文本原样保留：字段缺失或为
+		// null 时记为 nil；非字符串写法（数字、布尔、数组、对象）会在前面的
+		// 整体 Unmarshal 阶段报 JSON 类型错误，不会走到这里。
+		if missing.samplePoint == nil {
+			missing.samplePoint = map[string]*string{}
+		}
+		missing.samplePoint[key] = smp.PointID
 		for _, m := range smp.Measurements {
 			if m.Value == nil {
 				note(&missing.measValue, key, m.Item)
@@ -734,9 +765,19 @@ func probeMissingFields(data []byte) (missingFields, error) {
 // 编号；不补编号、不用集合编号回填、不移动或合并条目、不改变状态或重新判定。
 // 整份记录为 JSON null 时没有 id 字段，按缺少编号处理。
 //
+// 编号核对之后还要核对采样点归属：每份样品的 pointId 必须完整（字段缺失、为
+// null、为空字符串或仅含空白都算缺少采样点编号），且不含首尾空白——带首尾
+// 空白的编号不能整理后匹配采样点；完整编号按 JSON 解码后的文本与本文件已登记
+// 的采样点编号逐字匹配，不转换大小写，匹配不上时明确报告该采样点未登记，不能
+// 从限值记录或其他样品推测它存在。这条核对对任何状态的样品都生效：作废记录仍
+// 供按点核对，已确认样品的判定依据完整也不能代替采样点已经登记。不补登记采样
+// 点、不改写样品归属，整次打开失败、不回写原文件。
+//
 // key 是落盘 map 中的样品集合编号（JSON 解码后的文本），用于在记录本身残缺
-// （如空记录）时仍能指出是哪份样品。
-func validateLoadedSample(key string, smp *Sample, missing missingFields) error {
+// （如空记录）时仍能指出是哪份样品。points 是本文件中已登记的采样点集合，
+// 每份样品保存的采样点编号必须能在其中逐字找到；归属核对只看已登记的采样点，
+// 不能从限值记录或其他样品推测某个采样点存在。
+func validateLoadedSample(key string, smp *Sample, missing missingFields, points map[string]SamplingPoint) error {
 	// 编号核对先于状态、采样时间与测量等一切逐份检查：编号是按点查看、确认与
 	// 作废时定位样品的唯一依据。集合编号与记录自身 id 必须逐字一致，且沿用正常
 	// 录入保存的形式（不含首尾空白）。id 字段缺失、为 null、为空字符串或仅含
@@ -763,6 +804,30 @@ func validateLoadedSample(key string, smp *Sample, missing missingFields) error 
 	id := key
 	if smp == nil {
 		return fmt.Errorf("%w: 样品 %s 的记录为空", ErrCorruptRecord, key)
+	}
+	// 每份样品都必须明确属于一个已经登记的采样点：正常录入时采样点必须先登记，
+	// 打开已有本地数据时也要补上同一核对，否则文件只登记 P1、样品却写着 P9
+	// 时，只要其余内容通过检查就会被接受，已确认记录甚至能作为 P9 的最近有效
+	// 结果返回。pointId 字段缺失、保存为 null、为空字符串或仅含空白，都按缺少
+	// 采样点编号处理；带首尾空白的编号属于损坏，不能去掉空白后替它找一个采样点。
+	// 完整编号按 JSON 解码后的文本与已登记编号逐字匹配，不转换大小写：P1 与 p1
+	// 是不同编号；一处直接写 P1、另一处用 Unicode 转义表示同一文本则相同。编号
+	// 完整但没有对应登记记录时，明确说明该采样点未登记——不能从限值记录或其他
+	// 样品推测它存在。这条核对对任何状态的样品都生效：作废记录仍供按点核对，
+	// 不能放过丢失的归属；已确认样品的判定依据完整也不能代替采样点已经登记。
+	// 不补登记采样点、不改写样品归属，也不把拒绝推迟到确认或按点查询时。
+	rawPoint := missing.samplePoint[key]
+	switch {
+	case rawPoint == nil || strings.TrimSpace(*rawPoint) == "":
+		return fmt.Errorf("%w: 样品 %s 缺少采样点编号：pointId 字段缺失、为 null、为空字符串或仅含空白",
+			ErrCorruptRecord, id)
+	case *rawPoint != strings.TrimSpace(*rawPoint):
+		return fmt.Errorf("%w: 样品 %s 的采样点编号 %q 含首尾空白：编号必须完整且沿用正常录入保存的形式，不能整理空白后匹配采样点",
+			ErrCorruptRecord, id, *rawPoint)
+	}
+	if _, ok := points[*rawPoint]; !ok {
+		return fmt.Errorf("%w: 样品 %s 的采样点 %q 未登记：样品必须属于本文件中一个已经登记的采样点，不能凭限值记录或其他样品推测采样点存在",
+			ErrCorruptRecord, id, *rawPoint)
 	}
 	// 每份样品都必须明确写有三种状态之一（pending、confirmed、voided）：状态
 	// 决定样品能否产生有效结论，原测量完整、逐项判定齐全或作废原因仍在都不能
